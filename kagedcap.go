@@ -27,6 +27,8 @@ var Tasks = []string{
 	"ReCaptchaV3TaskProxyLess",
 	"ReCaptchaV3EnterpriseTask",
 	"ReCaptchaV3EnterpriseTaskProxyLess",
+	"ReCaptchaV2Task",
+	"ReCaptchaV2TaskProxyLess",
 }
 
 // Error is returned for any non-2xx response or transport failure.
@@ -45,8 +47,9 @@ func (e *Error) Error() string {
 type SolveParams struct {
 	Sitekey    string
 	URL        string
-	Action     string
-	Task       string // overrides Enterprise/Proxy derivation when set
+	Action     string // required for v3, ignored for v2
+	Task       string // overrides Version/Enterprise/Proxy derivation when set
+	Version    string // "v3" (default) or "v2" (invisible); ignored if Task is set
 	Enterprise bool
 	Proxy      string // omit for a ProxyLess solve
 	UserAgent  string
@@ -100,16 +103,21 @@ func New(apiKey string, opts ...Option) *Client {
 	return c
 }
 
-// DeriveTask picks the task string from the enterprise flag and whether a proxy is set.
-func DeriveTask(enterprise, hasProxy bool) string {
+// DeriveTask picks the task string from version, the enterprise flag, and whether a
+// proxy is set. version "v2" selects reCAPTCHA v2 invisible (no enterprise variant yet).
+func DeriveTask(enterprise, hasProxy bool, version string) string {
+	suffix := "TaskProxyLess"
+	if hasProxy {
+		suffix = "Task"
+	}
+	if version == "v2" {
+		return "ReCaptchaV2" + suffix
+	}
 	base := "ReCaptchaV3"
 	if enterprise {
 		base = "ReCaptchaV3Enterprise"
 	}
-	if hasProxy {
-		return base + "Task"
-	}
-	return base + "TaskProxyLess"
+	return base + suffix
 }
 
 // Solve solves a captcha and returns the token.
@@ -121,9 +129,10 @@ func (c *Client) Solve(p SolveParams) (*SolveResult, error) {
 func (c *Client) SolveContext(ctx context.Context, p SolveParams) (*SolveResult, error) {
 	task := p.Task
 	if task == "" {
-		task = DeriveTask(p.Enterprise, p.Proxy != "")
+		task = DeriveTask(p.Enterprise, p.Proxy != "", p.Version)
 	}
-	body := map[string]any{"task": task, "url": p.URL, "sitekey": p.Sitekey, "action": p.Action}
+	body := map[string]any{"task": task, "url": p.URL, "sitekey": p.Sitekey}
+	putIf(body, "action", p.Action) // omit when empty — v2 has no action, and "" fails validation
 	putIf(body, "proxy", p.Proxy)
 	putIf(body, "userAgent", p.UserAgent)
 	putIf(body, "device", p.Device)
