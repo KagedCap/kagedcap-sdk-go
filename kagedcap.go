@@ -1,10 +1,14 @@
-// Package kagedcap is the official Go SDK for KagedCap — solve reCAPTCHA v3 tokens
-// with an API key.
+// Package kagedcap is the official Go SDK for KagedCap — solve reCAPTCHA, Ticketmaster
+// tmpt, and Kasada with an API key.
 //
 //	kc := kagedcap.New(os.Getenv("KAGEDCAP_API_KEY"))
 //	res, err := kc.Solve(kagedcap.SolveParams{
 //	    Sitekey: "6Lc...", URL: "https://...", Action: "login", Enterprise: true,
 //	})
+//
+//	// Kasada — the login result carries its headers into the reload for you.
+//	login, _ := kc.KasadaLogin(kagedcap.KasadaParams{Site: "ticketmaster", Proxy: proxy})
+//	fresh, _ := kc.KasadaReload(login)
 package kagedcap
 
 import (
@@ -29,6 +33,9 @@ var Tasks = []string{
 	"ReCaptchaV3EnterpriseTaskProxyLess",
 	"ReCaptchaV2Task",
 	"ReCaptchaV2TaskProxyLess",
+	"TicketmasterTmptTask",
+	"KasadaLogin",
+	"KasadaReload",
 }
 
 // Error is returned for any non-2xx response or transport failure.
@@ -65,6 +72,29 @@ type SolveResult struct {
 	Task         string          `json:"task"`
 	Score        *float64        `json:"score"`
 	Verification json.RawMessage `json:"verification"`
+}
+
+// KasadaParams describes the inputs to start a Kasada session (KasadaLogin).
+type KasadaParams struct {
+	Proxy string // required — the Kasada token is IP-bound, so reuse it on the target request
+	Site  string // e.g. "ticketmaster"; defaults server-side when empty
+	URL   string // optional informational page URL
+}
+
+// KasadaResult is the response of a Kasada solve. There is no token — replay Headers
+// (user-agent + client hints) and the XKpsdk* values on your request. Pass the whole
+// result to KasadaReload to refresh the session later.
+type KasadaResult struct {
+	Success   bool              `json:"success"`
+	Task      string            `json:"task"`
+	Site      string            `json:"site"`
+	Headers   map[string]string `json:"headers"`
+	XKpsdkCt  string            `json:"x_kpsdk_ct"`
+	XKpsdkCd  string            `json:"x_kpsdk_cd"`
+	XKpsdkV   string            `json:"x_kpsdk_v"`
+	XKpsdkH   string            `json:"x_kpsdk_h"`
+	KpsdkST   *int64            `json:"kpsdk_st"`
+	UserAgent string            `json:"user_agent"`
 }
 
 // Balance is the account balance for the API key.
@@ -141,6 +171,48 @@ func (c *Client) SolveContext(ctx context.Context, p SolveParams) (*SolveResult,
 		body["enhanced"] = true
 	}
 	var out SolveResult
+	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// KasadaLogin starts a Kasada session and returns the full header set. Keep the result and
+// pass it to KasadaReload to refresh the session later. Proxy is required.
+func (c *Client) KasadaLogin(p KasadaParams) (*KasadaResult, error) {
+	return c.KasadaLoginContext(context.Background(), p)
+}
+
+// KasadaLoginContext is KasadaLogin with a caller-supplied context.
+func (c *Client) KasadaLoginContext(ctx context.Context, p KasadaParams) (*KasadaResult, error) {
+	body := map[string]any{"task": "KasadaLogin"}
+	putIf(body, "site", p.Site)
+	putIf(body, "url", p.URL)
+	putIf(body, "proxy", p.Proxy)
+	var out KasadaResult
+	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// KasadaReload refreshes a session from a prior KasadaLogin result — its KpsdkST and
+// XKpsdk* values are resent for you. No proxy needed.
+func (c *Client) KasadaReload(prev *KasadaResult) (*KasadaResult, error) {
+	return c.KasadaReloadContext(context.Background(), prev)
+}
+
+// KasadaReloadContext is KasadaReload with a caller-supplied context.
+func (c *Client) KasadaReloadContext(ctx context.Context, prev *KasadaResult) (*KasadaResult, error) {
+	if prev == nil || prev.KpsdkST == nil {
+		return nil, &Error{Code: "validation_error", Message: "KasadaReload: a prior KasadaLogin result with kpsdk_st is required"}
+	}
+	body := map[string]any{"task": "KasadaReload", "kpsdk_st": *prev.KpsdkST}
+	putIf(body, "site", prev.Site)
+	putIf(body, "x_kpsdk_ct", prev.XKpsdkCt)
+	putIf(body, "x_kpsdk_v", prev.XKpsdkV)
+	putIf(body, "x_kpsdk_h", prev.XKpsdkH)
+	var out KasadaResult
 	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
 		return nil, err
 	}

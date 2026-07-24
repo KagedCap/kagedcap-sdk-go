@@ -2,8 +2,8 @@
 
 # KagedCap Go SDK
 
-Solve reCAPTCHA v3 and v3 Enterprise tokens with a single API key. Standard library
-only — no dependencies.
+Solve reCAPTCHA (v3, v3 Enterprise, v2), Ticketmaster tmpt, and Kasada with a single API
+key. Standard library only — no dependencies.
 
 ## Install
 
@@ -60,6 +60,31 @@ res, err := kc.Solve(kagedcap.SolveParams{
 
 Leave `Proxy` empty for a ProxyLess solve. Set `Enterprise: true` for Enterprise
 sitekeys, or set `Task` explicitly.
+
+## Kasada
+
+`KasadaLogin` starts a session (requires a proxy — the token is IP-bound) and returns the
+full header set. Keep that result and pass it to `KasadaReload` to refresh the session — the
+SDK resends the session's `KpsdkST` and `XKpsdk*` values for you.
+
+```go
+login, err := kc.KasadaLogin(kagedcap.KasadaParams{
+	Site:  "ticketmaster",
+	Proxy: "http://user:pass@1.2.3.4:8080",
+})
+if err != nil {
+	log.Fatal(err)
+}
+// Replay login.Headers (user-agent + sec-ch-ua*) and login.XKpsdk* on your request.
+
+fresh, err := kc.KasadaReload(login) // no proxy needed
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(fresh.XKpsdkCd)
+```
+
+Kasada results have **no `Token`** — replay `Headers` and the `XKpsdk*` values instead.
 
 ## Errors
 
