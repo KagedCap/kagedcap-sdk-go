@@ -65,7 +65,7 @@ sitekeys, or set `Task` explicitly.
 
 `KasadaLogin` starts a session (requires a proxy — the token is IP-bound) and returns the
 full header set. Keep that result and pass it to `KasadaReload` to refresh the session — the
-SDK resends the session's `KpsdkST` and `XKpsdk*` values for you.
+SDK resends the session's `KpsdkST`, `Hash`, and `XKpsdk*` values for you (`Hash` + `XKpsdkCt` are required).
 
 ```go
 login, err := kc.KasadaLogin(kagedcap.KasadaParams{

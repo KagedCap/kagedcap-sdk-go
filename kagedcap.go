@@ -94,7 +94,11 @@ type KasadaResult struct {
 	XKpsdkV   string            `json:"x_kpsdk_v"`
 	XKpsdkH   string            `json:"x_kpsdk_h"`
 	KpsdkST   *int64            `json:"kpsdk_st"`
-	UserAgent string            `json:"user_agent"`
+	// Hash is the session PoW hash (sessionHash) — resent to KasadaReload to refresh the cd.
+	Hash string `json:"hash"`
+	// Reload is Kasada's trust verdict: true = high-trust token.
+	Reload    bool   `json:"reload"`
+	UserAgent string `json:"user_agent"`
 }
 
 // Balance is the account balance for the API key.
@@ -208,6 +212,7 @@ func (c *Client) KasadaReloadContext(ctx context.Context, prev *KasadaResult) (*
 		return nil, &Error{Code: "validation_error", Message: "KasadaReload: a prior KasadaLogin result with kpsdk_st is required"}
 	}
 	body := map[string]any{"task": "KasadaReload", "kpsdk_st": *prev.KpsdkST}
+	putIf(body, "hash", prev.Hash)
 	putIf(body, "site", prev.Site)
 	putIf(body, "x_kpsdk_ct", prev.XKpsdkCt)
 	putIf(body, "x_kpsdk_v", prev.XKpsdkV)
