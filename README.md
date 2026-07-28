@@ -101,6 +101,6 @@ if err != nil {
 ```
 
 Common codes: `unauthorized`, `insufficient_funds`, `solve_failed`, `solve_timeout`,
-`proxy_required`, `proxy_not_allowed`, `validation_error`.
+`proxy_required`, `proxy_not_allowed`, `validation_error`, `concurrency_limit_exceeded`, `key_frozen`.
 
 Only successful solves are billed.
