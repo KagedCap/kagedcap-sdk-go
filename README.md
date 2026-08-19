@@ -33,8 +33,8 @@ func main() {
 		Sitekey:    "6LcvL3UrAAAAAO_9u8Seiuf-I6F_tP_jSS-zndXV",
 		URL:        "https://www.ticketmaster.com",
 		Action:     "Event",
-		// Send a real desktop UA — the token embeds it, so match the browser your traffic presents.
-		UserAgent:  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		// UserAgent omitted — the SDK sends kagedcap.DefaultUserAgent, the same Chrome desktop
+		// profile the solver runs. Set it to match the browser your own traffic presents.
 		Enterprise: true, // ProxyLess Enterprise
 	})
 	if err != nil {
@@ -60,6 +60,23 @@ res, err := kc.Solve(kagedcap.SolveParams{
 
 Leave `Proxy` empty for a ProxyLess solve. Set `Enterprise: true` for Enterprise
 sitekeys, or set `Task` explicitly.
+
+## User agent
+
+The token embeds the UA, so every solve should carry one. Leave `UserAgent` empty and the
+SDK sends `kagedcap.DefaultUserAgent`; pass your own to override it:
+
+```go
+res, err := kc.Solve(kagedcap.SolveParams{
+	Sitekey:   "6Lc...",
+	URL:       "https://example.com/login",
+	Action:    "login",
+	UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ...", // match your traffic
+})
+```
+
+Kasada is the exception: `KasadaLogin` and `KasadaReload` never send a UA — the harvester
+picks the identity and hands it back in `Headers` and `UserAgent`.
 
 ## Kasada
 

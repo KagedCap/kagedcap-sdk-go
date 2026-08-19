@@ -25,6 +25,12 @@ import (
 // DefaultBaseURL is the production KagedCap endpoint.
 const DefaultBaseURL = "https://api.kagedcap.io"
 
+// DefaultUserAgent is sent on reCAPTCHA and Ticketmaster solves when SolveParams.UserAgent
+// is empty. It mirrors the Chrome desktop profile the solver fleet already runs, so the
+// default agrees with the identity the solve is performed under instead of fighting it.
+// Bump the Chrome version here and every solve follows.
+const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+
 // Tasks are the supported task types.
 var Tasks = []string{
 	"ReCaptchaV3Task",
@@ -59,7 +65,7 @@ type SolveParams struct {
 	Version    string // "v3" (default) or "v2" (invisible); ignored if Task is set
 	Enterprise bool
 	Proxy      string // omit for a ProxyLess solve
-	UserAgent  string
+	UserAgent  string // defaults to DefaultUserAgent; an explicit value always wins
 	Device     string
 	Enhanced   bool
 	SecretKey  string
@@ -168,7 +174,7 @@ func (c *Client) SolveContext(ctx context.Context, p SolveParams) (*SolveResult,
 	body := map[string]any{"task": task, "url": p.URL, "sitekey": p.Sitekey}
 	putIf(body, "action", p.Action) // omit when empty — v2 has no action, and "" fails validation
 	putIf(body, "proxy", p.Proxy)
-	putIf(body, "userAgent", p.UserAgent)
+	putIf(body, "userAgent", userAgentFor(task, p.UserAgent))
 	putIf(body, "device", p.Device)
 	putIf(body, "secretKey", p.SecretKey)
 	if p.Enhanced {
@@ -271,6 +277,16 @@ func (c *Client) request(ctx context.Context, method, path string, body map[stri
 		return &Error{Status: resp.StatusCode, Code: e.Error, Message: e.Message}
 	}
 	return json.Unmarshal(data, out)
+}
+
+// userAgentFor returns the UA to send for a task: the caller's value if they set one, else
+// DefaultUserAgent. Kasada is the exception — the gateway strips userAgent for that fleet and
+// the harvester reports the identity it actually used, so a default there would be a fiction.
+func userAgentFor(task, userAgent string) string {
+	if userAgent != "" || strings.HasPrefix(task, "Kasada") {
+		return userAgent
+	}
+	return DefaultUserAgent
 }
 
 func putIf(m map[string]any, k, v string) {
