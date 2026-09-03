@@ -1,5 +1,5 @@
 // Package kagedcap is the official Go SDK for KagedCap — solve reCAPTCHA, Ticketmaster
-// tmpt, and Kasada with an API key.
+// tmpt, Kasada, and Ticketmaster evaluate with an API key.
 //
 //	kc := kagedcap.New(os.Getenv("KAGEDCAP_API_KEY"))
 //	res, err := kc.Solve(kagedcap.SolveParams{
@@ -9,6 +9,9 @@
 //	// Kasada — the login result carries its headers into the reload for you.
 //	login, _ := kc.KasadaLogin(kagedcap.KasadaParams{Site: "ticketmaster", Proxy: proxy})
 //	fresh, _ := kc.KasadaReload(login)
+//
+//	// Evaluate — an EPSF allow token for the next APS step.
+//	ev, _ := kc.Evaluate(kagedcap.EvaluateParams{URL: "https://auth.ticketmaster.com/...", Proxy: proxy})
 package kagedcap
 
 import (
@@ -42,6 +45,7 @@ var Tasks = []string{
 	"TicketmasterTmptTask",
 	"KasadaLogin",
 	"KasadaReload",
+	"EvaluateTask",
 }
 
 // Error is returned for any non-2xx response or transport failure.
@@ -105,6 +109,30 @@ type KasadaResult struct {
 	// Reload is Kasada's trust verdict: true = high-trust token.
 	Reload    bool   `json:"reload"`
 	UserAgent string `json:"user_agent"`
+}
+
+// EvaluateParams describes a Ticketmaster evaluate request — the EPSF step that gates
+// phone verification and queue entry.
+type EvaluateParams struct {
+	URL   string // required — a Ticketmaster host; it also selects the default action
+	Proxy string // required — "http://user:pass@host:port" (or host:port:user:pass)
+	// Action overrides the action: "verify_phone" or "join_queue". Leave it empty unless the
+	// caller asked for one — the solver derives it from URL (auth.* hosts verify a phone,
+	// everything else joins a queue), and a default here would silently override that.
+	Action      string
+	PhoneNumber string // verify_phone only; include the country prefix, e.g. "+12025550123"
+	QueueID     string // join_queue only; sent as queueId
+	EventID     string // join_queue only; sent as eventId
+	UserAgent   string // defaults to DefaultUserAgent; an explicit value always wins
+}
+
+// EvaluateResult is the response of a successful evaluate. Token is the EPSF allow token to
+// replay on the next APS step; Decision is "allow", "challenge", or "block".
+type EvaluateResult struct {
+	Success  bool   `json:"success"`
+	Task     string `json:"task"`
+	Token    string `json:"token"`
+	Decision string `json:"decision"`
 }
 
 // Balance is the account balance for the API key.
@@ -224,6 +252,27 @@ func (c *Client) KasadaReloadContext(ctx context.Context, prev *KasadaResult) (*
 	putIf(body, "x_kpsdk_v", prev.XKpsdkV)
 	putIf(body, "x_kpsdk_h", prev.XKpsdkH)
 	var out KasadaResult
+	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// Evaluate runs the Ticketmaster evaluate step and returns the EPSF allow token. URL and
+// Proxy are required.
+func (c *Client) Evaluate(p EvaluateParams) (*EvaluateResult, error) {
+	return c.EvaluateContext(context.Background(), p)
+}
+
+// EvaluateContext is Evaluate with a caller-supplied context.
+func (c *Client) EvaluateContext(ctx context.Context, p EvaluateParams) (*EvaluateResult, error) {
+	body := map[string]any{"task": "EvaluateTask", "url": p.URL, "proxy": p.Proxy}
+	putIf(body, "action", p.Action) // omit when empty so the host-based default applies
+	putIf(body, "phone_number", p.PhoneNumber)
+	putIf(body, "queueId", p.QueueID) // camelCase on the wire — snake_case is dropped
+	putIf(body, "eventId", p.EventID)
+	putIf(body, "userAgent", userAgentFor("EvaluateTask", p.UserAgent))
+	var out EvaluateResult
 	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
 		return nil, err
 	}

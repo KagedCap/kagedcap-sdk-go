@@ -2,8 +2,8 @@
 
 # KagedCap Go SDK
 
-Solve reCAPTCHA (v3, v3 Enterprise, v2), Ticketmaster tmpt, and Kasada with a single API
-key. Standard library only — no dependencies.
+Solve reCAPTCHA (v3, v3 Enterprise, v2), Ticketmaster tmpt, Kasada, and Ticketmaster
+evaluate with a single API key. Standard library only — no dependencies.
 
 ## Install
 
@@ -102,6 +102,41 @@ fmt.Println(fresh.XKpsdkCd)
 ```
 
 Kasada results have **no `Token`** — replay `Headers` and the `XKpsdk*` values instead.
+
+## Evaluate
+
+`Evaluate` runs Ticketmaster's EPSF step and returns the allow token to replay on the next
+APS request. `URL` and `Proxy` are required.
+
+```go
+ev, err := kc.Evaluate(kagedcap.EvaluateParams{
+	URL:         "https://auth.ticketmaster.com/epsf/gec/",
+	Proxy:       "http://user:pass@1.2.3.4:8080",
+	PhoneNumber: "+12025550123", // verify_phone only
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(ev.Token, ev.Decision) // decision: allow | challenge | block
+```
+
+`Action` is derived from `URL` — `auth.*` hosts verify a phone, any other Ticketmaster host
+joins a queue. Leave it empty to keep that default, or set it to `"verify_phone"` /
+`"join_queue"` to override. For a queue join, pass `QueueID` and `EventID` instead of
+`PhoneNumber`:
+
+```go
+ev, err := kc.Evaluate(kagedcap.EvaluateParams{
+	URL:     "https://queue.ticketmaster.com/...",
+	Proxy:   "http://user:pass@1.2.3.4:8080",
+	QueueID: "...",
+	EventID: "...",
+})
+```
+
+Unset fields are omitted from the request. `UserAgent` follows the same rule as `Solve` —
+empty sends `kagedcap.DefaultUserAgent` — and it picks the solver's device profile, not just
+a header, so match it to your own traffic.
 
 ## Errors
 
