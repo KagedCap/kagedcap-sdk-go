@@ -8,10 +8,11 @@ evaluate with a single API key. Standard library only — no dependencies.
 ## Install
 
 ```bash
-go get github.com/kagedcap/kagedcap-sdk-go
+go get github.com/kagedcap/kagedcap-sdk-go/v2
 ```
 
-Requires Go 1.21+.
+Requires Go 1.21+. v2 changes how `Solve` talks to the API — see
+[Upgrading to v2](#upgrading-to-v2).
 
 ## Quick start
 
@@ -22,8 +23,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 
-	kagedcap "github.com/kagedcap/kagedcap-sdk-go"
+	kagedcap "github.com/kagedcap/kagedcap-sdk-go/v2"
 )
 
 func main() {
@@ -35,7 +37,8 @@ func main() {
 		Action:     "Event",
 		// UserAgent omitted — the SDK sends kagedcap.DefaultUserAgent, the same Chrome desktop
 		// profile the solver runs. Set it to match the browser your own traffic presents.
-		Enterprise: true, // ProxyLess Enterprise
+		Enterprise: true,             // ProxyLess Enterprise
+		Deadline:   90 * time.Second, // give up after this; unset means 120s
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -45,6 +48,77 @@ func main() {
 	bal, _ := kc.CheckBalance()
 	fmt.Println("balance:", bal.Display)
 }
+```
+
+`Solve` still blocks and still hands you a token. Underneath it now submits the job to
+`POST /v2/solve` (which answers `202` with a job id) and polls `GET /v2/solve/{id}` until the
+job reports `done`, so no request is held open for the length of a solve.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `Deadline` | `120 * time.Second` | Whole budget: the submit plus every poll after it |
+| `PollInterval` | `5 * time.Second` | Wait between status polls |
+| `CallbackURL` | unset | Sent as `callback_url` — https and publicly resolvable. The gateway posts the finished solve to you as well; `Solve` polls either way |
+| `IdempotencyKey` | unset | Sent as the `Idempotency-Key` header on the submit. The gateway dedupes on it durably and across shards, so retrying a submit you never saw the answer to returns the original job instead of paying for a second solve |
+
+A successful result adds `SolveMS` and `ElapsedMS` — how long the solver took, and the wall
+clock from submit to completion. Both are `*float64` because the gateway may report neither;
+`nil` means "not reported", never zero. `Score` and `Verification` are **not** in the v2 poll
+response and stay `nil` on this path — only `SolveDeprecated` fills them in.
+
+Failures come back as `*kagedcap.Error`, the same type `Solve` has always returned:
+
+| Code | When |
+| --- | --- |
+| `solve_timeout` | `Deadline` (or the context's) ran out while polling |
+| `canceled` | the context was cancelled |
+| the gateway's own code | the job reported `failed` — its `error` is passed through, e.g. `proxy_required`; `solve_failed` when it gives no reason |
+| `result_expired` | the job finished but its token was already cleared — see below |
+| `not_found` | the id is unknown, or belongs to another account |
+
+Results are kept for about five minutes after a solve completes, then the token is cleared
+(a reCAPTCHA token is dead inside two minutes anyway). A poll that arrives after that still
+says `done` but carries no token, and `Solve` reports it as `result_expired` rather than
+handing you an empty string that looks like success.
+
+## Cancellation
+
+`SolveContext` takes a `context.Context` and the poll loop honours it. Whichever runs out
+first — the context's deadline or `Deadline` — ends the wait; cancelling the context stops
+polling with code `canceled`.
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+defer cancel()
+
+res, err := kc.SolveContext(ctx, kagedcap.SolveParams{
+	Sitekey: "6Lc...",
+	URL:     "https://example.com/login",
+	Action:  "login",
+})
+```
+
+## Upgrading to v2
+
+The import path gains `/v2` and `Solve` moves to the submit-and-poll endpoints described
+above. Its signature is unchanged — the same params in, the same `*SolveResult` out — so most
+callers only edit the import line. Two things to check:
+
+- `Score` and `Verification` are always `nil` from `Solve` now; the v2 poll response has no
+  equivalent. Use `SolveDeprecated` if you branch on them.
+- A failed job surfaces the gateway's own error code rather than a blanket `solve_failed`.
+
+`SolveParams` and `SolveResult` gained fields but lost none, and `Kasada*`, `Evaluate`, and
+`CheckBalance` are untouched.
+
+`SolveDeprecated` (and `SolveDeprecatedContext`) call the legacy synchronous `/solve`
+endpoint, which holds the HTTP connection open for the whole solve. Behaviour is exactly
+v1's `Solve`, so it is the one-line escape hatch while you migrate — but it is going away,
+and it ignores `Deadline`, `PollInterval`, `CallbackURL`, and `IdempotencyKey`. The only
+bound on it is the client's own `http.Client` timeout.
+
+```go
+res, err := kc.SolveDeprecated(params) // legacy blocking /solve
 ```
 
 ## With a proxy
@@ -140,7 +214,8 @@ a header, so match it to your own traffic.
 
 ## Errors
 
-Failures return `*kagedcap.Error` with `.Status`, `.Code`, and `.Message`:
+Failures return `*kagedcap.Error` with `.Status`, `.Code`, `.Message`, and `.RequestID` —
+quote the request id when reporting a failure:
 
 ```go
 res, err := kc.Solve(params)
@@ -154,5 +229,9 @@ if err != nil {
 
 Common codes: `unauthorized`, `insufficient_funds`, `solve_failed`, `solve_timeout`,
 `proxy_required`, `proxy_not_allowed`, `validation_error`, `concurrency_limit_exceeded`, `key_frozen`.
+A submit can also fail with `callback_url_invalid`, `maintenance`, or `proxyless_disabled`.
+
+`solve_timeout`, `canceled`, and `result_expired` are raised by `Solve` itself rather than by
+the API, so they carry no `.Status` or `.RequestID`.
 
 Only successful solves are billed.
