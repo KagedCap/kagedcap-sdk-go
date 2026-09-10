@@ -374,3 +374,61 @@ func TestSolveKeepsPollingThroughAnUnknownStatus(t *testing.T) {
 		t.Errorf("Token = %q, want tok", res.Token)
 	}
 }
+
+/*
+ * Only reCAPTCHA rides the async endpoint.
+ *
+ * A v2 job row holds one token string, so it cannot represent a Kasada result (headers,
+ * x_kpsdk_*, hash — no token at all) or evaluate's `decision`. Routing those through /v2/solve
+ * charged the customer and handed back an empty token. These pin the split so a future "v2 for
+ * everything" change has to delete a test that says why.
+ */
+
+func TestSolveUsesTheAsyncEndpointForRecaptcha(t *testing.T) {
+	var submitted string
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/solve":
+			submitted = r.URL.Path
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-1","status":"running"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/solve/job-1":
+			io.WriteString(w, `{"success":true,"id":"job-1","status":"done","token":"03AFcWeA"}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	p := params()
+	p.Task = "ReCaptchaV3EnterpriseTask"
+	if _, err := kc.Solve(p); err != nil {
+		t.Fatalf("Solve: %v", err)
+	}
+	if submitted != "/v2/solve" {
+		t.Errorf("reCAPTCHA submitted to %q, want /v2/solve", submitted)
+	}
+}
+
+func TestSolveUsesTheSynchronousEndpointForNonRecaptcha(t *testing.T) {
+	// Kasada is the case that made this a billing bug: it has no token to put in a job row.
+	for _, task := range []string{"KasadaLogin", "KasadaReload", "TicketmasterTmptTask", "EvaluateTask"} {
+		t.Run(task, func(t *testing.T) {
+			var hit string
+			kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+				hit = r.URL.Path
+				if r.URL.Path != "/solve" {
+					t.Errorf("%s went to %s — the async job row cannot carry its result", task, r.URL.Path)
+				}
+				io.WriteString(w, `{"success":true,"token":"t","task":"`+task+`"}`)
+			})
+			p := params()
+			p.Task = task
+			if _, err := kc.Solve(p); err != nil {
+				t.Fatalf("Solve(%s): %v", task, err)
+			}
+			if hit != "/solve" {
+				t.Errorf("%s submitted to %q, want /solve", task, hit)
+			}
+		})
+	}
+}

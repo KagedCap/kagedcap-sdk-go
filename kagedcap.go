@@ -274,6 +274,19 @@ func (c *Client) SolveContext(ctx context.Context, p SolveParams) (*SolveResult,
 	defer cancel()
 
 	task := taskFor(p)
+
+	// tmpt, evaluate and Kasada run over /solve. Not a limitation of those fleets — the async
+	// job row cannot hold their results (see isRecaptchaTask). Transparent to the caller: they
+	// still get that fleet's full response, still bounded by Deadline and still cancellable via
+	// ctx; only the transport differs.
+	if !isRecaptchaTask(task) {
+		var out SolveResult
+		if err := c.request(ctx, http.MethodPost, "/solve", solveBody(p, task), &out); err != nil {
+			return nil, solveWaitErr(ctx, "solving", err)
+		}
+		return &out, nil
+	}
+
 	body := solveBody(p, task)
 	putIf(body, "callback_url", p.CallbackURL)
 	var job solveJob
@@ -492,6 +505,22 @@ func withIdempotencyKey(key string) func(*http.Request) {
 // taskFor is the task a set of params resolves to — the caller's explicit Task, else the one
 // derived from version, enterprise, and proxy. The v2 poll response never echoes the task
 // back, so Solve keeps this value to fill in SolveResult.Task.
+// isRecaptchaTask reports whether a task's result can be represented by an async job.
+//
+// A v2 job row stores a single token string and GET /v2/solve/{id} returns that and nothing
+// else. Per fleet: reCAPTCHA is a token (v2 also drops Score/Verification); tmpt is a token;
+// evaluate additionally returns a decision, which would be lost; and Kasada has no token at all
+// — it answers with headers, x_kpsdk_ct/cd/v/h, hash and kpsdk_st.
+//
+// Kasada is what makes this a billing bug rather than a cosmetic one: the solve dispatches,
+// succeeds, is charged for, and the job row has nowhere to put the result, so the caller polls
+// to "done" and reads an empty token. Non-reCAPTCHA work therefore goes over /solve.
+//
+// Widen this ONLY when the job row can carry the fleet's result, not when v2 merely accepts it.
+func isRecaptchaTask(task string) bool {
+	return strings.HasPrefix(task, "ReCaptcha")
+}
+
 func taskFor(p SolveParams) string {
 	if p.Task != "" {
 		return p.Task
