@@ -205,6 +205,27 @@ type Balance struct {
 	HeldMicros      string `json:"held_micros"`
 	AvailableMicros string `json:"available_micros"`
 	Display         string `json:"display"`
+	// Subscriptions lists the solve packages on the key that made the call; empty when it has none.
+	Subscriptions []Subscription `json:"subscriptions"`
+}
+
+// Subscription is a solve package on the calling API key: a fixed number of solves of one
+// type per period, drawn on instead of balance.
+type Subscription struct {
+	ID          string  `json:"id"`
+	Package     string  `json:"package"`
+	SKU         string  `json:"sku"`
+	Period      string  `json:"period"` // "week" | "month"
+	Status      string  `json:"status"` // "active" | "canceling" | "past_due"
+	Quota       int64   `json:"quota"`
+	Used        int64   `json:"used"`
+	Remaining   int64   `json:"remaining"`
+	PeriodStart *string `json:"period_start"`
+	PeriodEnd   *string `json:"period_end"`
+	// RenewsAt is when the next period starts and Used resets; nil when canceling or past due.
+	RenewsAt *string `json:"renews_at"`
+	// ExpiresAt is when the package ends after a cancel; nil otherwise.
+	ExpiresAt *string `json:"expires_at"`
 }
 
 // Client is a KagedCap API client. Safe for concurrent use.
