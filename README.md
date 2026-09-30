@@ -72,7 +72,7 @@ Failures come back as `*kagedcap.Error`, the same type `Solve` has always return
 | --- | --- |
 | `solve_timeout` | `Deadline` (or the context's) ran out while polling |
 | `canceled` | the context was cancelled |
-| the gateway's own code | the job reported `failed` — its `error` is passed through, e.g. `proxy_required`; `solve_failed` when it gives no reason |
+| the gateway's own code | the job reported `failed` — its `error` is passed through, e.g. `proxy_unreachable`; `solve_failed` when it gives no reason |
 | `result_expired` | the job finished but its token was already cleared — see below |
 | `not_found` | the id is unknown, or belongs to another account |
 
@@ -227,11 +227,41 @@ if err != nil {
 }
 ```
 
-Common codes: `unauthorized`, `insufficient_funds`, `solve_failed`, `solve_timeout`,
-`proxy_required`, `proxy_not_allowed`, `validation_error`, `concurrency_limit_exceeded`, `key_frozen`.
-A submit can also fail with `callback_url_invalid`, `maintenance`, or `proxyless_disabled`.
+Every error from the gateway carries one of these stable `.Code` values:
 
-`solve_timeout`, `canceled`, and `result_expired` are raised by `Solve` itself rather than by
-the API, so they carry no `.Status` or `.RequestID`.
+| Code | HTTP | Meaning |
+| --- | --- | --- |
+| `validation_error` | 400 | bad request shape |
+| `proxy_invalid` | 400 | proxy malformed or disallowed — caught pre-flight, no solve attempted |
+| `callback_url_invalid` | 400 | `callback_url` wasn't a public https URL |
+| `unauthorized` | 401 | missing or invalid API key |
+| `insufficient_funds` | 402 | balance too low |
+| `key_spend_cap_reached` | 402 | the key hit its spend cap |
+| `subscription_quota_exhausted` | 402 | the solve package is out of quota |
+| `subscription_past_due` | 402 | the subscription is past due |
+| `account_suspended` | 403 | the account is suspended |
+| `host_not_allowed` | 403 | the key's allowlist doesn't include the page host |
+| `not_found` | 404 | a `/v2` job id that's unknown, expired, or not yours |
+| `idempotency_conflict` | 409 | the `Idempotency-Key` was reused with a different request |
+| `proxy_unreachable` | 422 | the solve ran and your proxy didn't answer — not billed (was `502` before 2026-09-24) |
+| `concurrency_limit_exceeded` | 429 | too many solves in flight |
+| `key_frozen` | 429 | key auto-frozen after a burst of failed solves (usually bad proxies) |
+| `rate_limited` | 429 | request rate too high |
+| `overloaded` | 429 | the gateway is shedding load |
+| `internal_error` | 500 | an unexpected gateway error |
+| `solve_failed` | 502 | the solve was attempted and failed — not billed |
+| `no_capacity` | 503 | no solver capacity right now |
+| `solver_unavailable` | 503 | a node was chosen but couldn't be reached |
+| `maintenance` | 503 | the fleet is in maintenance |
+| `proxyless_disabled` | 503 | proxyless solves are disabled |
+| `solve_timeout` | 504 | the solve ran past its deadline — not billed |
+
+Retry `429`, `503`, and `504` with backoff. A `502` `solve_failed` or `422` `proxy_unreachable`
+means a real solve was attempted (and not billed), so fix the input rather than retrying blindly —
+for `422` it's always the proxy.
+
+`solve_timeout`, `canceled`, `network_error`, and `result_expired` can also be raised by the SDK
+itself rather than by the API, so those carry no `.Status` or `.RequestID`; the SDK's `solve_timeout`
+is the local `Deadline` firing, distinct from the gateway's `504`.
 
 Only successful solves are billed.
