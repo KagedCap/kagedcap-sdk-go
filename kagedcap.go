@@ -7,9 +7,14 @@
 //	    Deadline: 90 * time.Second,
 //	})
 //
-// Solve submits the job to /v2/solve and polls /v2/solve/{id} every 5s for it, blocking until
-// the token is ready — set Deadline (120s by default) to bound that wait. SolveDeprecated
-// still calls the legacy synchronous endpoint and holds a request open for the whole solve.
+// reCAPTCHA, Ticketmaster tmpt and evaluate run over the async endpoint: the SDK submits the job
+// to /v2/solve and polls /v2/solve/{id} every 5s for it, blocking until the result is ready — set
+// Deadline (120s by default) to bound that wait — without holding a request open for the whole
+// solve. The gateway's job row carries each fleet's full result, so a poll returns exactly what
+// the synchronous endpoint did.
+//
+// Kasada is the exception: KasadaLogin and KasadaReload POST to the synchronous /solve endpoint,
+// which returns the full header set on the one request and holds the connection open for the solve.
 //
 //	// Kasada — the login result carries its headers into the reload for you.
 //	login, _ := kc.KasadaLogin(kagedcap.KasadaParams{Site: "ticketmaster", Proxy: proxy})
@@ -17,6 +22,14 @@
 //
 //	// Evaluate — an EPSF allow token for the next APS step.
 //	ev, _ := kc.Evaluate(kagedcap.EvaluateParams{URL: "https://auth.ticketmaster.com/...", Proxy: proxy})
+//
+// The *Deprecated methods (SolveDeprecated, KasadaLoginDeprecated, KasadaReloadDeprecated,
+// EvaluateDeprecated) call the legacy synchronous /solve endpoint. SolveDeprecated and
+// EvaluateDeprecated are kept for a gradual migration off the async path and will be removed;
+// prefer Solve and Evaluate. KasadaLoginDeprecated and KasadaReloadDeprecated now behave exactly
+// like KasadaLogin and KasadaReload, which are themselves synchronous. For manual control of the
+// async families (your own poll loop, or a callback-driven flow) use the SubmitSolve + GetSolve
+// primitives.
 package kagedcap
 
 import (
@@ -39,13 +52,13 @@ const DefaultBaseURL = "https://api.kagedcap.io"
 // Bump the Chrome version here and every solve follows.
 const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 
-// DefaultSolveDeadline is the budget Solve gets for the submit plus every poll when
-// SolveParams.Deadline is unset.
+// DefaultSolveDeadline is the budget a solve gets for the submit plus every poll when no
+// per-call Deadline is set.
 const DefaultSolveDeadline = 120 * time.Second
 
-// DefaultPollInterval is the wait between GET /v2/solve/{id} polls when SolveParams.PollInterval
-// is unset. Measured solve_ms p50 is 1.2-2.1s, so the first poll is nearly always early —
-// shorten this one constant (or set PollInterval) when we decide to chase that.
+// DefaultPollInterval is the wait between GET /v2/solve/{id} polls when no PollInterval is set.
+// Measured solve_ms p50 is 1.2-2.1s, so the first poll is nearly always early — shorten this one
+// constant (or set PollInterval) when we decide to chase that.
 const DefaultPollInterval = 5 * time.Second
 
 // Tasks are the supported task types.
@@ -96,29 +109,29 @@ type SolveParams struct {
 	SecretKey  string
 	// CallbackURL is sent as callback_url so the gateway posts the finished solve to you as
 	// well. It must be https and publicly resolvable or the submit fails with
-	// callback_url_invalid. Solve polls either way; omitted when empty. SolveDeprecated
-	// ignores it.
+	// callback_url_invalid. The method polls either way; omitted when empty. The *Deprecated
+	// methods ignore it.
 	CallbackURL string
 	// IdempotencyKey is sent as the Idempotency-Key header on the submit. The gateway dedupes
 	// on it durably and across shards, so a caller that retries a submit whose answer it never
 	// saw gets the original job back instead of paying for a second solve. Opaque, and yours
 	// to generate — the SDK never invents one, since a key it made up would not survive the
-	// process that would need it. SolveDeprecated ignores it.
+	// process that would need it. The *Deprecated methods ignore it.
 	IdempotencyKey string
-	// Deadline is the whole budget Solve has — the submit and every poll after it. Zero means
+	// Deadline is the whole budget a solve has — the submit and every poll after it. Zero means
 	// DefaultSolveDeadline. A context deadline still wins if it comes first.
 	Deadline time.Duration
 	// PollInterval is the wait between status polls. Zero means DefaultPollInterval.
 	PollInterval time.Duration
 }
 
-// SolveResult is the response of a successful solve.
+// SolveResult is the response of a successful reCAPTCHA or tmpt solve.
 type SolveResult struct {
 	Success bool   `json:"success"`
 	Token   string `json:"token"`
 	Task    string `json:"task"`
-	// Score and Verification only ever come back from SolveDeprecated: the v2 poll response
-	// carries neither, so on the Solve path they stay nil. Don't branch on them.
+	// Score and Verification are reCAPTCHA-only and may be null — the gateway sends them when it
+	// has them. Both are nil for tmpt. nil means "not reported", never zero; don't branch on them.
 	Score        *float64        `json:"score"`
 	Verification json.RawMessage `json:"verification"`
 	// SolveMS is how long the solver itself took, ElapsedMS the wall clock from submit to
@@ -128,24 +141,45 @@ type SolveResult struct {
 	ElapsedMS *float64 `json:"elapsed_ms"`
 }
 
-// solveJob is the POST /v2/solve acknowledgement (HTTP 202) — the solve is queued, not
+// Submission is the POST /v2/solve acknowledgement (HTTP 202) — the solve is queued, not
 // finished, so the only field worth anything here is the id to poll.
-type solveJob struct {
+type Submission struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
 }
 
-// solveStatus is one GET /v2/solve/{id} poll. The response also carries id, created_at,
-// completed_at and, when a callback_url was given, a callback delivery counter; none of them
-// change what the poll loop does, so they are left undecoded. Note the absence of success:
-// it is true only once status is "done", which makes it a redundant restatement of status
-// rather than the completion test.
-type solveStatus struct {
+// Job is one GET /v2/solve/{id} poll. The envelope (id, status, error, timings) is always
+// present; the rest is the solved result, spread at top level by the gateway and so varying by
+// task family — reCAPTCHA/tmpt fill Token (+ Score/Verification), evaluate adds Decision, and
+// Kasada fills Site/Headers/XKpsdk*/Hash/KpsdkST/UserAgent with no token at all. Every result
+// field is cleared ~5 minutes after completion, so a late poll reads a done job with them empty;
+// the typed methods detect that and return result_expired rather than an empty result.
+//
+// `success` is deliberately not decoded: it is true only once status is "done", which makes it a
+// redundant restatement of status rather than the completion test.
+type Job struct {
+	ID        string   `json:"id"`
 	Status    string   `json:"status"` // "running" | "done" | "failed"
-	Token     string   `json:"token"`  // null once the result expires — see the done branch
 	Error     string   `json:"error"`
 	SolveMS   *float64 `json:"solve_ms"`
 	ElapsedMS *float64 `json:"elapsed_ms"`
+
+	// Result fields (present on "done" until the sweep clears them).
+	Task         string            `json:"task"`
+	Token        string            `json:"token"`
+	Score        *float64          `json:"score"`
+	Verification json.RawMessage   `json:"verification"`
+	Decision     string            `json:"decision"`
+	Site         string            `json:"site"`
+	Headers      map[string]string `json:"headers"`
+	XKpsdkCt     string            `json:"x_kpsdk_ct"`
+	XKpsdkCd     string            `json:"x_kpsdk_cd"`
+	XKpsdkV      string            `json:"x_kpsdk_v"`
+	XKpsdkH      string            `json:"x_kpsdk_h"`
+	KpsdkST      *int64            `json:"kpsdk_st"`
+	Hash         string            `json:"hash"`
+	Reload       bool              `json:"reload"`
+	UserAgent    string            `json:"user_agent"`
 }
 
 // KasadaParams describes the inputs to start a Kasada session (KasadaLogin).
@@ -153,21 +187,26 @@ type KasadaParams struct {
 	Proxy string // required — the Kasada token is IP-bound, so reuse it on the target request
 	Site  string // e.g. "ticketmaster"; defaults server-side when empty
 	URL   string // optional informational page URL
+	// Deadline and PollInterval are accepted for source compatibility but no longer apply:
+	// KasadaLogin and KasadaReload are synchronous, so there is no poll loop to bound. The
+	// client's own http.Client timeout is the only bound, as with the other synchronous methods.
+	Deadline     time.Duration
+	PollInterval time.Duration
 }
 
 // KasadaResult is the response of a Kasada solve. There is no token — replay Headers
 // (user-agent + client hints) and the XKpsdk* values on your request. Pass the whole
 // result to KasadaReload to refresh the session later.
 type KasadaResult struct {
-	Success   bool              `json:"success"`
-	Task      string            `json:"task"`
-	Site      string            `json:"site"`
-	Headers   map[string]string `json:"headers"`
-	XKpsdkCt  string            `json:"x_kpsdk_ct"`
-	XKpsdkCd  string            `json:"x_kpsdk_cd"`
-	XKpsdkV   string            `json:"x_kpsdk_v"`
-	XKpsdkH   string            `json:"x_kpsdk_h"`
-	KpsdkST   *int64            `json:"kpsdk_st"`
+	Success  bool              `json:"success"`
+	Task     string            `json:"task"`
+	Site     string            `json:"site"`
+	Headers  map[string]string `json:"headers"`
+	XKpsdkCt string            `json:"x_kpsdk_ct"`
+	XKpsdkCd string            `json:"x_kpsdk_cd"`
+	XKpsdkV  string            `json:"x_kpsdk_v"`
+	XKpsdkH  string            `json:"x_kpsdk_h"`
+	KpsdkST  *int64            `json:"kpsdk_st"`
 	// Hash is the session PoW hash (sessionHash) — resent to KasadaReload to refresh the cd.
 	Hash string `json:"hash"`
 	// Reload is Kasada's trust verdict: true = high-trust token.
@@ -188,6 +227,10 @@ type EvaluateParams struct {
 	QueueID     string // join_queue only; sent as queueId
 	EventID     string // join_queue only; sent as eventId
 	UserAgent   string // defaults to DefaultUserAgent; an explicit value always wins
+	// Deadline / PollInterval bound the async wait; zero means the defaults. Evaluate drives a
+	// full BotGuard VM, so leave Deadline at the 120s default unless you know your flow is faster.
+	Deadline     time.Duration
+	PollInterval time.Duration
 }
 
 // EvaluateResult is the response of a successful evaluate. Token is the EPSF allow token to
@@ -273,9 +316,11 @@ func DeriveTask(enterprise, hasProxy bool, version string) string {
 	return base + suffix
 }
 
-// Solve solves a captcha and returns the token. It submits the solve to /v2/solve and polls
-// every PollInterval until the solver is done, so it blocks for the length of the solve just
-// as it always has — without holding a request open for it. Give up after Deadline.
+// Solve solves a reCAPTCHA or Ticketmaster tmpt captcha and returns the token. It submits to
+// /v2/solve and polls every PollInterval until the solver is done, so it blocks for the length
+// of the solve just as it always has — without holding a request open for it. Give up after
+// Deadline. For Kasada use KasadaLogin/KasadaReload (no token result); for the evaluate
+// decision use Evaluate.
 func (c *Client) Solve(p SolveParams) (*SolveResult, error) {
 	return c.SolveContext(context.Background(), p)
 }
@@ -283,98 +328,73 @@ func (c *Client) Solve(p SolveParams) (*SolveResult, error) {
 // SolveContext is Solve with a caller-supplied context. Cancelling ctx stops the poll loop,
 // and whichever runs out first — ctx's deadline or SolveParams.Deadline — ends the wait.
 func (c *Client) SolveContext(ctx context.Context, p SolveParams) (*SolveResult, error) {
-	deadline := p.Deadline
-	if deadline <= 0 {
-		deadline = DefaultSolveDeadline
+	task := taskFor(p)
+	if isKasadaTask(task) {
+		// A Kasada result has no token, so SolveResult cannot represent it — steer the caller to
+		// the method that returns the header set rather than hand back an empty, "successful" token.
+		return nil, &Error{Code: "validation_error", Message: "Solve does not return a Kasada result; use KasadaLogin or KasadaReload"}
 	}
-	interval := p.PollInterval
-	if interval <= 0 {
-		interval = DefaultPollInterval
-	}
-	ctx, cancel := context.WithTimeout(ctx, deadline)
+	ctx, cancel := withDeadline(ctx, p.Deadline)
 	defer cancel()
 
-	task := taskFor(p)
-
-	// tmpt, evaluate and Kasada run over /solve. Not a limitation of those fleets — the async
-	// job row cannot hold their results (see isRecaptchaTask). Transparent to the caller: they
-	// still get that fleet's full response, still bounded by Deadline and still cancellable via
-	// ctx; only the transport differs.
-	if !isRecaptchaTask(task) {
-		var out SolveResult
-		if err := c.request(ctx, http.MethodPost, "/solve", solveBody(p, task), &out); err != nil {
-			return nil, solveWaitErr(ctx, "solving", err)
-		}
-		return &out, nil
-	}
-
-	body := solveBody(p, task)
-	putIf(body, "callback_url", p.CallbackURL)
-	var job solveJob
-	if err := c.request(ctx, http.MethodPost, "/v2/solve", body, &job, withIdempotencyKey(p.IdempotencyKey)); err != nil {
+	sub, err := c.SubmitSolveContext(ctx, p)
+	if err != nil {
 		return nil, solveWaitErr(ctx, "submitting the solve", err)
 	}
-	if job.ID == "" {
-		// The submit answered 202 without an id, so there is nothing to poll and no way to
-		// find the job again. Gateway bug, not the caller's — name it as one.
-		return nil, &Error{Code: "internal_error", Message: "Solve: /v2/solve accepted the job but returned no id"}
+	job, err := c.poll(ctx, sub.ID, pollInterval(p.PollInterval), "waiting for solve "+sub.ID)
+	if err != nil {
+		return nil, err
 	}
+	if job.Token == "" {
+		// The gateway clears results roughly five minutes after completion (and a reCAPTCHA token
+		// is dead inside two anyway), so "done" with no token is a late read of a finished job,
+		// not a solve that produced an empty string — returning "" would look like success.
+		return nil, expiredErr("solve", sub.ID)
+	}
+	return job.toSolveResult(task), nil
+}
 
-	where := "waiting for solve " + job.ID
-	timer := time.NewTimer(interval)
-	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, solveWaitErr(ctx, where, ctx.Err())
-		case <-timer.C:
-		}
-		var st solveStatus
-		if err := c.request(ctx, http.MethodGet, "/v2/solve/"+job.ID, nil, &st); err != nil {
-			// Includes not_found (404), which the gateway also returns for a job belonging to
-			// another account. Either way the id will never resolve, so stop rather than burn
-			// the deadline on it.
-			return nil, solveWaitErr(ctx, where, err)
-		}
-		// status is the completion test, never success — success is just "status == done"
-		// restated, and reading it instead would call a running solve a failure.
-		switch st.Status {
-		case "done":
-			if st.Token == "" {
-				// The gateway clears token roughly five minutes after completion, and a
-				// reCAPTCHA token is dead inside two anyway. So "done" with no token is a
-				// late read of a finished job, not a solve that produced an empty string —
-				// handing back "" would look like success to every caller.
-				return nil, &Error{Code: "result_expired", Message: "solve " + job.ID + " completed but its token has already been cleared; results are kept for about five minutes"}
-			}
-			return &SolveResult{
-				Success: true,
-				Token:   st.Token,
-				// The poll body does not echo the task back, and this is the one we submitted.
-				Task:      task,
-				SolveMS:   st.SolveMS,
-				ElapsedMS: st.ElapsedMS,
-			}, nil
-		case "failed":
-			// The poll body carries error alone — no separate human message — so it lands in
-			// Code, where v1 callers already switch on the gateway's own codes.
-			code, detail := st.Error, st.Error
-			if code == "" {
-				code, detail = "solve_failed", "no reason given"
-			}
-			return nil, &Error{Code: code, Message: "solve " + job.ID + " failed: " + detail}
-		}
-		// Anything else — "running" today — means keep waiting. Treating an unfamiliar status
-		// as terminal would break the SDK the day the gateway adds one.
-		timer.Reset(interval)
+// SubmitSolve submits a reCAPTCHA or tmpt solve to /v2/solve and returns the job id to poll with
+// GetSolve, without waiting. Use it to drive your own poll loop or a callback-driven flow; most
+// callers want Solve, which submits and polls for you.
+func (c *Client) SubmitSolve(p SolveParams) (*Submission, error) {
+	return c.SubmitSolveContext(context.Background(), p)
+}
+
+// SubmitSolveContext is SubmitSolve with a caller-supplied context.
+func (c *Client) SubmitSolveContext(ctx context.Context, p SolveParams) (*Submission, error) {
+	task := taskFor(p)
+	if isKasadaTask(task) {
+		return nil, &Error{Code: "validation_error", Message: "SubmitSolve does not handle Kasada; use KasadaLogin or KasadaReload"}
 	}
+	body := solveBody(p, task)
+	putIf(body, "callback_url", p.CallbackURL)
+	return c.submitRaw(ctx, body, p.IdempotencyKey)
+}
+
+// GetSolve fetches one job by id (GET /v2/solve/{id}). Status is "running", "done" or "failed";
+// on "done" the result fields are populated until the ~5-minute sweep clears them. It is the
+// poll primitive behind every async method, exposed for manual or callback-driven use.
+func (c *Client) GetSolve(id string) (*Job, error) {
+	return c.GetSolveContext(context.Background(), id)
+}
+
+// GetSolveContext is GetSolve with a caller-supplied context.
+func (c *Client) GetSolveContext(ctx context.Context, id string) (*Job, error) {
+	if id == "" {
+		return nil, &Error{Code: "validation_error", Message: "GetSolve: id is required"}
+	}
+	var job Job
+	if err := c.request(ctx, http.MethodGet, "/v2/solve/"+id, nil, &job); err != nil {
+		return nil, err
+	}
+	return &job, nil
 }
 
 // SolveDeprecated solves a captcha over the legacy synchronous /solve endpoint, which holds
 // the HTTP connection open for the whole solve. Behaviour is exactly what Solve did before
-// v2, down to returning Score and Verification; the async fields (CallbackURL,
-// IdempotencyKey, Deadline, PollInterval) do not apply and are ignored — the client's own
-// http.Client timeout is the only bound.
+// v2; the async fields (CallbackURL, IdempotencyKey, Deadline, PollInterval) do not apply and
+// are ignored — the client's own http.Client timeout is the only bound.
 //
 // Deprecated: use Solve, which submits to /v2/solve and polls for the result.
 func (c *Client) SolveDeprecated(p SolveParams) (*SolveResult, error) {
@@ -393,64 +413,83 @@ func (c *Client) SolveDeprecatedContext(ctx context.Context, p SolveParams) (*So
 }
 
 // KasadaLogin starts a Kasada session and returns the full header set. Keep the result and
-// pass it to KasadaReload to refresh the session later. Proxy is required.
+// pass it to KasadaReload to refresh the session later. Proxy is required. POSTs to the
+// synchronous /solve endpoint and returns the result directly — no submit-and-poll.
 func (c *Client) KasadaLogin(p KasadaParams) (*KasadaResult, error) {
 	return c.KasadaLoginContext(context.Background(), p)
 }
 
 // KasadaLoginContext is KasadaLogin with a caller-supplied context.
 func (c *Client) KasadaLoginContext(ctx context.Context, p KasadaParams) (*KasadaResult, error) {
-	body := map[string]any{"task": "KasadaLogin"}
-	putIf(body, "site", p.Site)
-	putIf(body, "url", p.URL)
-	putIf(body, "proxy", p.Proxy)
-	var out KasadaResult
-	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
-		return nil, err
-	}
-	return &out, nil
+	return c.kasadaSync(ctx, kasadaLoginBody(p))
 }
 
 // KasadaReload refreshes a session from a prior KasadaLogin result — its KpsdkST and
-// XKpsdk* values are resent for you. No proxy needed.
+// XKpsdk* values are resent for you. No proxy needed. POSTs to the synchronous /solve endpoint
+// and returns the result directly — no submit-and-poll.
 func (c *Client) KasadaReload(prev *KasadaResult) (*KasadaResult, error) {
 	return c.KasadaReloadContext(context.Background(), prev)
 }
 
 // KasadaReloadContext is KasadaReload with a caller-supplied context.
 func (c *Client) KasadaReloadContext(ctx context.Context, prev *KasadaResult) (*KasadaResult, error) {
-	if prev == nil || prev.KpsdkST == nil {
-		return nil, &Error{Code: "validation_error", Message: "KasadaReload: a prior KasadaLogin result with kpsdk_st is required"}
-	}
-	body := map[string]any{"task": "KasadaReload", "kpsdk_st": *prev.KpsdkST}
-	putIf(body, "hash", prev.Hash)
-	putIf(body, "site", prev.Site)
-	putIf(body, "x_kpsdk_ct", prev.XKpsdkCt)
-	putIf(body, "x_kpsdk_v", prev.XKpsdkV)
-	putIf(body, "x_kpsdk_h", prev.XKpsdkH)
-	var out KasadaResult
-	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
+	body, err := kasadaReloadBody(prev)
+	if err != nil {
 		return nil, err
 	}
-	return &out, nil
+	return c.kasadaSync(ctx, body)
+}
+
+// KasadaLoginDeprecated starts a Kasada session over the synchronous /solve endpoint.
+//
+// Deprecated: use KasadaLogin, which is now synchronous and behaves identically.
+func (c *Client) KasadaLoginDeprecated(p KasadaParams) (*KasadaResult, error) {
+	return c.kasadaSync(context.Background(), kasadaLoginBody(p))
+}
+
+// KasadaReloadDeprecated refreshes a session over the synchronous /solve endpoint.
+//
+// Deprecated: use KasadaReload, which is now synchronous and behaves identically.
+func (c *Client) KasadaReloadDeprecated(prev *KasadaResult) (*KasadaResult, error) {
+	body, err := kasadaReloadBody(prev)
+	if err != nil {
+		return nil, err
+	}
+	return c.kasadaSync(context.Background(), body)
 }
 
 // Evaluate runs the Ticketmaster evaluate step and returns the EPSF allow token. URL and
-// Proxy are required.
+// Proxy are required. Submits to /v2/solve and polls for the result.
 func (c *Client) Evaluate(p EvaluateParams) (*EvaluateResult, error) {
 	return c.EvaluateContext(context.Background(), p)
 }
 
 // EvaluateContext is Evaluate with a caller-supplied context.
 func (c *Client) EvaluateContext(ctx context.Context, p EvaluateParams) (*EvaluateResult, error) {
-	body := map[string]any{"task": "EvaluateTask", "url": p.URL, "proxy": p.Proxy}
-	putIf(body, "action", p.Action) // omit when empty so the host-based default applies
-	putIf(body, "phone_number", p.PhoneNumber)
-	putIf(body, "queueId", p.QueueID) // camelCase on the wire — snake_case is dropped
-	putIf(body, "eventId", p.EventID)
-	putIf(body, "userAgent", userAgentFor("EvaluateTask", p.UserAgent))
+	ctx, cancel := withDeadline(ctx, p.Deadline)
+	defer cancel()
+	sub, err := c.submitRaw(ctx, evaluateBody(p), "")
+	if err != nil {
+		return nil, solveWaitErr(ctx, "submitting the evaluate", err)
+	}
+	job, err := c.poll(ctx, sub.ID, pollInterval(p.PollInterval), "waiting for evaluate "+sub.ID)
+	if err != nil {
+		return nil, err
+	}
+	// Decision, not token: a challenge verdict legitimately carries an empty token, so an empty
+	// decision is the only reliable "result cleared" signal for evaluate.
+	if job.Decision == "" {
+		return nil, expiredErr("evaluate", sub.ID)
+	}
+	return job.toEvaluateResult(), nil
+}
+
+// EvaluateDeprecated runs evaluate over the legacy synchronous /solve endpoint.
+//
+// Deprecated: use Evaluate, which submits to /v2/solve and polls for the result.
+func (c *Client) EvaluateDeprecated(p EvaluateParams) (*EvaluateResult, error) {
 	var out EvaluateResult
-	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
+	if err := c.request(context.Background(), http.MethodPost, "/solve", evaluateBody(p), &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -463,6 +502,78 @@ func (c *Client) CheckBalance() (*Balance, error) {
 		return nil, err
 	}
 	return &out, nil
+}
+
+// kasadaSync POSTs a Kasada body to the synchronous /solve endpoint and decodes the full result
+// directly — no submit-and-poll. It backs KasadaLogin/KasadaReload and their *Deprecated aliases.
+func (c *Client) kasadaSync(ctx context.Context, body map[string]any) (*KasadaResult, error) {
+	var out KasadaResult
+	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// submitRaw POSTs a prepared body to /v2/solve and returns the acknowledgement.
+func (c *Client) submitRaw(ctx context.Context, body map[string]any, idempotencyKey string) (*Submission, error) {
+	var sub Submission
+	if err := c.request(ctx, http.MethodPost, "/v2/solve", body, &sub, withIdempotencyKey(idempotencyKey)); err != nil {
+		return nil, err
+	}
+	if sub.ID == "" {
+		// The submit answered 202 without an id, so there is nothing to poll and no way to find
+		// the job again. Gateway bug, not the caller's — name it as one.
+		return nil, &Error{Code: "internal_error", Message: "/v2/solve accepted the job but returned no id"}
+	}
+	return &sub, nil
+}
+
+// poll loops GET /v2/solve/{id} every interval until the job is done (returns the Job), failed
+// (returns the gateway's error code) or ctx runs out. An unfamiliar status means keep waiting:
+// treating one as terminal would break the SDK the day the gateway adds one.
+func (c *Client) poll(ctx context.Context, id string, interval time.Duration, where string) (*Job, error) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, solveWaitErr(ctx, where, ctx.Err())
+		case <-timer.C:
+		}
+		job, err := c.GetSolveContext(ctx, id)
+		if err != nil {
+			// Includes not_found (404), which the gateway also returns for a job belonging to
+			// another account. Either way the id will never resolve, so stop rather than burn
+			// the deadline on it.
+			return nil, solveWaitErr(ctx, where, err)
+		}
+		switch job.Status {
+		case "done":
+			return job, nil
+		case "failed":
+			// The poll body carries error alone — no separate human message — so it lands in
+			// Code, where v1 callers already switch on the gateway's own codes.
+			code, detail := job.Error, job.Error
+			if code == "" {
+				code, detail = "solve_failed", "no reason given"
+			}
+			return nil, &Error{Code: code, Message: "solve " + id + " failed: " + detail}
+		}
+		timer.Reset(interval)
+	}
+}
+
+func (j *Job) toSolveResult(task string) *SolveResult {
+	t := j.Task
+	if t == "" {
+		// Older gateways did not echo the task in the poll body; fall back to the one submitted.
+		t = task
+	}
+	return &SolveResult{Success: true, Token: j.Token, Task: t, Score: j.Score, Verification: j.Verification, SolveMS: j.SolveMS, ElapsedMS: j.ElapsedMS}
+}
+
+func (j *Job) toEvaluateResult() *EvaluateResult {
+	return &EvaluateResult{Success: true, Task: j.Task, Token: j.Token, Decision: j.Decision}
 }
 
 // request performs one API call. decorate runs after the standard headers are set, which is
@@ -523,24 +634,9 @@ func withIdempotencyKey(key string) func(*http.Request) {
 	}
 }
 
-// taskFor is the task a set of params resolves to — the caller's explicit Task, else the one
-// derived from version, enterprise, and proxy. The v2 poll response never echoes the task
-// back, so Solve keeps this value to fill in SolveResult.Task.
-// isRecaptchaTask reports whether a task's result can be represented by an async job.
-//
-// A v2 job row stores a single token string and GET /v2/solve/{id} returns that and nothing
-// else. Per fleet: reCAPTCHA is a token (v2 also drops Score/Verification); tmpt is a token;
-// evaluate additionally returns a decision, which would be lost; and Kasada has no token at all
-// — it answers with headers, x_kpsdk_ct/cd/v/h, hash and kpsdk_st.
-//
-// Kasada is what makes this a billing bug rather than a cosmetic one: the solve dispatches,
-// succeeds, is charged for, and the job row has nowhere to put the result, so the caller polls
-// to "done" and reads an empty token. Non-reCAPTCHA work therefore goes over /solve.
-//
-// Widen this ONLY when the job row can carry the fleet's result, not when v2 merely accepts it.
-func isRecaptchaTask(task string) bool {
-	return strings.HasPrefix(task, "ReCaptcha")
-}
+// isKasadaTask reports whether a task is a Kasada one — the family whose result has no token and
+// so cannot be returned as a SolveResult.
+func isKasadaTask(task string) bool { return strings.HasPrefix(task, "Kasada") }
 
 func taskFor(p SolveParams) string {
 	if p.Task != "" {
@@ -564,15 +660,66 @@ func solveBody(p SolveParams, task string) map[string]any {
 	return body
 }
 
+func kasadaLoginBody(p KasadaParams) map[string]any {
+	body := map[string]any{"task": "KasadaLogin"}
+	putIf(body, "site", p.Site)
+	putIf(body, "url", p.URL)
+	putIf(body, "proxy", p.Proxy)
+	return body
+}
+
+func kasadaReloadBody(prev *KasadaResult) (map[string]any, error) {
+	if prev == nil || prev.KpsdkST == nil {
+		return nil, &Error{Code: "validation_error", Message: "KasadaReload: a prior KasadaLogin result with kpsdk_st is required"}
+	}
+	body := map[string]any{"task": "KasadaReload", "kpsdk_st": *prev.KpsdkST}
+	putIf(body, "hash", prev.Hash)
+	putIf(body, "site", prev.Site)
+	putIf(body, "x_kpsdk_ct", prev.XKpsdkCt)
+	putIf(body, "x_kpsdk_v", prev.XKpsdkV)
+	putIf(body, "x_kpsdk_h", prev.XKpsdkH)
+	return body, nil
+}
+
+func evaluateBody(p EvaluateParams) map[string]any {
+	body := map[string]any{"task": "EvaluateTask", "url": p.URL, "proxy": p.Proxy}
+	putIf(body, "action", p.Action) // omit when empty so the host-based default applies
+	putIf(body, "phone_number", p.PhoneNumber)
+	putIf(body, "queueId", p.QueueID) // camelCase on the wire — snake_case is dropped
+	putIf(body, "eventId", p.EventID)
+	putIf(body, "userAgent", userAgentFor("EvaluateTask", p.UserAgent))
+	return body
+}
+
+// withDeadline bounds a solve's whole wait (submit + polls). Zero uses DefaultSolveDeadline; a
+// caller's own ctx deadline still wins if it is sooner.
+func withDeadline(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if d <= 0 {
+		d = DefaultSolveDeadline
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+func pollInterval(d time.Duration) time.Duration {
+	if d <= 0 {
+		return DefaultPollInterval
+	}
+	return d
+}
+
+func expiredErr(kind, id string) *Error {
+	return &Error{Code: "result_expired", Message: kind + " " + id + " completed but its result has already been cleared; results are kept for about five minutes"}
+}
+
 // solveWaitErr keeps the poll loop speaking the SDK's error type: a context that ran out is a
-// solve_timeout whichever deadline fired, the caller's own or SolveParams.Deadline. Anything
+// solve_timeout whichever deadline fired, the caller's own or the per-call Deadline. Anything
 // else is a real transport or API failure and travels untouched.
 func solveWaitErr(ctx context.Context, where string, err error) error {
 	switch ctx.Err() {
 	case context.DeadlineExceeded:
-		return &Error{Code: "solve_timeout", Message: "Solve: deadline exceeded " + where}
+		return &Error{Code: "solve_timeout", Message: "deadline exceeded " + where}
 	case context.Canceled:
-		return &Error{Code: "canceled", Message: "Solve: context canceled " + where}
+		return &Error{Code: "canceled", Message: "context canceled " + where}
 	}
 	return err
 }

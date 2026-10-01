@@ -63,8 +63,8 @@ job reports `done`, so no request is held open for the length of a solve.
 
 A successful result adds `SolveMS` and `ElapsedMS` — how long the solver took, and the wall
 clock from submit to completion. Both are `*float64` because the gateway may report neither;
-`nil` means "not reported", never zero. `Score` and `Verification` are **not** in the v2 poll
-response and stay `nil` on this path — only `SolveDeprecated` fills them in.
+`nil` means "not reported", never zero. `Score` and `Verification` are reCAPTCHA-only and come
+back from the poll when the gateway has them; they stay `nil` for tmpt and whenever not reported.
 
 Failures come back as `*kagedcap.Error`, the same type `Solve` has always returned:
 
@@ -104,12 +104,19 @@ The import path gains `/v2` and `Solve` moves to the submit-and-poll endpoints d
 above. Its signature is unchanged — the same params in, the same `*SolveResult` out — so most
 callers only edit the import line. Two things to check:
 
-- `Score` and `Verification` are always `nil` from `Solve` now; the v2 poll response has no
-  equivalent. Use `SolveDeprecated` if you branch on them.
 - A failed job surfaces the gateway's own error code rather than a blanket `solve_failed`.
+- `Evaluate` now submits to `/v2/solve` and polls as well — same signature and result type,
+  just no request held open.
+- `KasadaLogin` and `KasadaReload` POST to the synchronous `/solve` endpoint and return the
+  full result on the one request; they do not use the async submit-and-poll path. Same
+  signatures and result types as before.
+- The `*Deprecated` variants (`KasadaLoginDeprecated`, `KasadaReloadDeprecated`,
+  `EvaluateDeprecated`) still call the legacy `/solve`; for Kasada they now behave exactly like
+  the plain methods.
+- New primitives `SubmitSolve` and `GetSolve` expose the submit and poll steps directly, for a
+  callback-driven flow or your own loop.
 
-`SolveParams` and `SolveResult` gained fields but lost none, and `Kasada*`, `Evaluate`, and
-`CheckBalance` are untouched.
+`SolveParams` and `SolveResult` gained fields but lost none, and `CheckBalance` is untouched.
 
 `SolveDeprecated` (and `SolveDeprecatedContext`) call the legacy synchronous `/solve`
 endpoint, which holds the HTTP connection open for the whole solve. Behaviour is exactly
@@ -177,6 +184,11 @@ fmt.Println(fresh.XKpsdkCd)
 
 Kasada results have **no `Token`** — replay `Headers` and the `XKpsdk*` values instead.
 
+`KasadaLogin` and `KasadaReload` POST to the synchronous `/solve` endpoint and hand back the
+full result on the one request — no submit-and-poll, so a request is held open for the length
+of the solve. `KasadaLoginDeprecated` / `KasadaReloadDeprecated` call the same `/solve` and now
+behave identically.
+
 ## Evaluate
 
 `Evaluate` runs Ticketmaster's EPSF step and returns the allow token to replay on the next
@@ -211,6 +223,9 @@ ev, err := kc.Evaluate(kagedcap.EvaluateParams{
 Unset fields are omitted from the request. `UserAgent` follows the same rule as `Solve` —
 empty sends `kagedcap.DefaultUserAgent` — and it picks the solver's device profile, not just
 a header, so match it to your own traffic.
+
+`Evaluate` submits to `/v2/solve` and polls for the result; `EvaluateDeprecated` uses the
+legacy blocking `/solve`.
 
 ## Errors
 

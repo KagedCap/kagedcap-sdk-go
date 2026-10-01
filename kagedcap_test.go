@@ -376,12 +376,12 @@ func TestSolveKeepsPollingThroughAnUnknownStatus(t *testing.T) {
 }
 
 /*
- * Only reCAPTCHA rides the async endpoint.
+ * reCAPTCHA, tmpt and evaluate ride the async endpoint; Kasada is synchronous.
  *
- * A v2 job row holds one token string, so it cannot represent a Kasada result (headers,
- * x_kpsdk_*, hash — no token at all) or evaluate's `decision`. Routing those through /v2/solve
- * charged the customer and handed back an empty token. These pin the split so a future "v2 for
- * everything" change has to delete a test that says why.
+ * The v2 job row carries the async fleets' full result (a token, or evaluate's decision), so
+ * Solve and Evaluate submit to /v2/solve and poll. Kasada stays on the synchronous /solve, which
+ * returns its full header set + x_kpsdk_* on the one request — no submit-and-poll. Solve itself
+ * rejects a Kasada task, because a KasadaResult has no token for a SolveResult to carry.
  */
 
 func TestSolveUsesTheAsyncEndpointForRecaptcha(t *testing.T) {
@@ -409,26 +409,242 @@ func TestSolveUsesTheAsyncEndpointForRecaptcha(t *testing.T) {
 	}
 }
 
-func TestSolveUsesTheSynchronousEndpointForNonRecaptcha(t *testing.T) {
-	// Kasada is the case that made this a billing bug: it has no token to put in a job row.
-	for _, task := range []string{"KasadaLogin", "KasadaReload", "TicketmasterTmptTask", "EvaluateTask"} {
+func TestSolveRoutesTmptToTheAsyncEndpoint(t *testing.T) {
+	var submitted string
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/solve":
+			submitted = r.URL.Path
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-t","status":"running"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/solve/job-t":
+			io.WriteString(w, `{"success":true,"id":"job-t","status":"done","task":"TicketmasterTmptTask","token":"tmpt-cookie"}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	p := params()
+	p.Task = "TicketmasterTmptTask"
+	res, err := kc.Solve(p)
+	if err != nil {
+		t.Fatalf("Solve(tmpt): %v", err)
+	}
+	if submitted != "/v2/solve" {
+		t.Errorf("tmpt submitted to %q, want /v2/solve", submitted)
+	}
+	if res.Token != "tmpt-cookie" {
+		t.Errorf("Token = %q, want tmpt-cookie", res.Token)
+	}
+}
+
+func TestSolveRejectsAKasadaTaskWithoutCallingTheAPI(t *testing.T) {
+	// Solve cannot represent a tokenless Kasada result — it must steer to KasadaLogin before
+	// spending a request, not poll to "done" and hand back an empty token.
+	for _, task := range []string{"KasadaLogin", "KasadaReload"} {
 		t.Run(task, func(t *testing.T) {
-			var hit string
 			kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
-				hit = r.URL.Path
-				if r.URL.Path != "/solve" {
-					t.Errorf("%s went to %s — the async job row cannot carry its result", task, r.URL.Path)
-				}
-				io.WriteString(w, `{"success":true,"token":"t","task":"`+task+`"}`)
+				t.Errorf("Solve(%s) hit the API at %s; it should reject before any request", task, r.URL.Path)
 			})
 			p := params()
 			p.Task = task
-			if _, err := kc.Solve(p); err != nil {
-				t.Fatalf("Solve(%s): %v", task, err)
-			}
-			if hit != "/solve" {
-				t.Errorf("%s submitted to %q, want /solve", task, hit)
+			_, err := kc.Solve(p)
+			if got := kcErr(t, err).Code; got != "validation_error" {
+				t.Errorf("Code = %q, want validation_error", got)
 			}
 		})
+	}
+}
+
+func kasadaParams() kagedcap.KasadaParams {
+	return kagedcap.KasadaParams{Site: "ticketmaster", Proxy: "http://u:p@1.2.3.4:8080"}
+}
+
+func TestKasadaLoginPostsTheSynchronousSolveAndReturnsTheHeaderSet(t *testing.T) {
+	var calls atomic.Int32
+	var hit, method, task string
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		hit, method = r.URL.Path, r.Method
+		task, _ = body["task"].(string)
+		io.WriteString(w, `{"success":true,"task":"KasadaLogin","site":"ticketmaster","headers":{"user-agent":"UA"},"x_kpsdk_ct":"ct","x_kpsdk_cd":"cd","x_kpsdk_v":"v","x_kpsdk_h":"h","kpsdk_st":123,"hash":"hh","reload":true,"user_agent":"UA"}`)
+	})
+	res, err := kc.KasadaLogin(kasadaParams())
+	if err != nil {
+		t.Fatalf("KasadaLogin: %v", err)
+	}
+	if method != http.MethodPost || hit != "/solve" || task != "KasadaLogin" {
+		t.Errorf("request was %s %q task=%q, want POST /solve KasadaLogin", method, hit, task)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("made %d requests, want 1 — /solve returns the result directly, no poll", n)
+	}
+	if res.XKpsdkCt != "ct" || res.Headers["user-agent"] != "UA" || res.KpsdkST == nil || *res.KpsdkST != 123 {
+		t.Errorf("result lost fields: %+v", res)
+	}
+}
+
+func TestKasadaReloadResendsThePriorSessionToTheSynchronousSolve(t *testing.T) {
+	st := int64(123)
+	prev := &kagedcap.KasadaResult{KpsdkST: &st, Hash: "hh", Site: "ticketmaster", XKpsdkCt: "ct0"}
+	var calls atomic.Int32
+	var hit string
+	var sent map[string]any
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		hit = r.URL.Path
+		json.NewDecoder(r.Body).Decode(&sent)
+		io.WriteString(w, `{"success":true,"task":"KasadaReload","x_kpsdk_ct":"ct1","x_kpsdk_cd":"cd1"}`)
+	})
+	res, err := kc.KasadaReload(prev)
+	if err != nil {
+		t.Fatalf("KasadaReload: %v", err)
+	}
+	if hit != "/solve" {
+		t.Errorf("hit %q, want /solve", hit)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("made %d requests, want 1 — the sync endpoint returns the result directly, no poll", n)
+	}
+	if sent["task"] != "KasadaReload" || sent["kpsdk_st"].(float64) != 123 || sent["hash"] != "hh" {
+		t.Errorf("reload body lost the prior session: %v", sent)
+	}
+	if res.XKpsdkCt != "ct1" {
+		t.Errorf("XKpsdkCt = %q, want the refreshed ct1", res.XKpsdkCt)
+	}
+}
+
+func TestKasadaReloadRequiresAPriorSession(t *testing.T) {
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("KasadaReload(nil) hit the API; it must validate first")
+	})
+	_, err := kc.KasadaReload(nil)
+	if got := kcErr(t, err).Code; got != "validation_error" {
+		t.Errorf("Code = %q, want validation_error", got)
+	}
+}
+
+func evalParams() kagedcap.EvaluateParams {
+	return kagedcap.EvaluateParams{URL: "https://auth.ticketmaster.com/x", Proxy: "http://u:p@1.2.3.4:8080", PollInterval: 5 * time.Millisecond, Deadline: 2 * time.Second}
+}
+
+func TestEvaluatePollsTheAsyncEndpointAndReturnsTheDecision(t *testing.T) {
+	var submitted string
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/solve":
+			submitted = r.URL.Path
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-e","status":"running"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/solve/job-e":
+			io.WriteString(w, `{"success":true,"id":"job-e","status":"done","task":"EvaluateTask","token":"ev-tok","decision":"allow"}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	})
+	res, err := kc.Evaluate(evalParams())
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if submitted != "/v2/solve" {
+		t.Errorf("evaluate submitted to %q, want /v2/solve", submitted)
+	}
+	if res.Token != "ev-tok" || res.Decision != "allow" {
+		t.Errorf("result = %+v, want token ev-tok decision allow", res)
+	}
+}
+
+func TestEvaluateKeepsAChallengeDecisionEvenWithNoToken(t *testing.T) {
+	// A challenge verdict legitimately has an empty token, so evaluate must key "expired" on a
+	// missing decision, not a missing token — otherwise every challenge reads as expired.
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-e","status":"running"}`)
+			return
+		}
+		io.WriteString(w, `{"success":true,"id":"job-e","status":"done","task":"EvaluateTask","token":"","decision":"challenge"}`)
+	})
+	res, err := kc.Evaluate(evalParams())
+	if err != nil {
+		t.Fatalf("Evaluate: %v", err)
+	}
+	if res.Decision != "challenge" {
+		t.Errorf("Decision = %q, want challenge", res.Decision)
+	}
+}
+
+func TestEvaluateReportsResultExpiredWhenDoneCarriesNoDecision(t *testing.T) {
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-e","status":"running"}`)
+			return
+		}
+		io.WriteString(w, `{"success":true,"id":"job-e","status":"done"}`)
+	})
+	_, err := kc.Evaluate(evalParams())
+	if got := kcErr(t, err).Code; got != "result_expired" {
+		t.Errorf("Code = %q, want result_expired", got)
+	}
+}
+
+func TestDeprecatedMethodsStillUseTheSynchronousEndpoint(t *testing.T) {
+	st := int64(1)
+	cases := []struct {
+		name string
+		call func(*kagedcap.Client) error
+	}{
+		{"KasadaLoginDeprecated", func(c *kagedcap.Client) error { _, e := c.KasadaLoginDeprecated(kasadaParams()); return e }},
+		{"KasadaReloadDeprecated", func(c *kagedcap.Client) error {
+			_, e := c.KasadaReloadDeprecated(&kagedcap.KasadaResult{KpsdkST: &st, Hash: "h"})
+			return e
+		}},
+		{"EvaluateDeprecated", func(c *kagedcap.Client) error { _, e := c.EvaluateDeprecated(evalParams()); return e }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var hit string
+			kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+				hit = r.URL.Path
+				io.WriteString(w, `{"success":true,"task":"t","x_kpsdk_ct":"ct","decision":"allow"}`)
+			})
+			if err := tc.call(kc); err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+			if hit != "/solve" {
+				t.Errorf("%s hit %q, want the legacy /solve", tc.name, hit)
+			}
+		})
+	}
+}
+
+func TestSubmitSolveAndGetSolveDriveThePrimitivesDirectly(t *testing.T) {
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/solve":
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-p","status":"running"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/solve/job-p":
+			io.WriteString(w, `{"success":true,"id":"job-p","status":"done","token":"tok-p"}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	})
+	sub, err := kc.SubmitSolve(params())
+	if err != nil {
+		t.Fatalf("SubmitSolve: %v", err)
+	}
+	if sub.ID != "job-p" || sub.Status != "running" {
+		t.Errorf("Submission = %+v, want id job-p status running", sub)
+	}
+	job, err := kc.GetSolve(sub.ID)
+	if err != nil {
+		t.Fatalf("GetSolve: %v", err)
+	}
+	if job.Status != "done" || job.Token != "tok-p" {
+		t.Errorf("Job = %+v, want status done token tok-p", job)
 	}
 }
