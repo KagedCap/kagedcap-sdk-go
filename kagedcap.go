@@ -30,15 +30,28 @@
 // like KasadaLogin and KasadaReload, which are themselves synchronous. For manual control of the
 // async families (your own poll loop, or a callback-driven flow) use the SubmitSolve + GetSolve
 // primitives.
+//
+// Transient failures — HTTP 429, 500, 502, 503, 504 and transport errors — are retried on the v2
+// submit and poll with jittered exponential backoff until the deadline; see RetryPolicy,
+// WithRetryPolicy and WithoutRetries. Every v2 submit carries an Idempotency-Key, generated per
+// call when SolveParams does not set one, so a retried submit can never become a second billable
+// solve. The legacy /solve (SolveDeprecated, EvaluateDeprecated) carries one too, and is retried
+// only on failures that never reached the gateway (transport errors, the edge's own non-JSON
+// 429/502/503/504) and never more than 100s after its first attempt, since the gateway's claim on
+// the key lives 120s. Kasada carries no key and is sent exactly once.
 package kagedcap
 
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -60,6 +73,34 @@ const DefaultSolveDeadline = 120 * time.Second
 // Measured solve_ms p50 is 1.2-2.1s, so the first poll is nearly always early — shorten this one
 // constant (or set PollInterval) when we decide to chase that.
 const DefaultPollInterval = 5 * time.Second
+
+// Retry defaults. See RetryPolicy for what each one bounds.
+const (
+	DefaultRetryInitialBackoff = 250 * time.Millisecond
+	DefaultRetryMaxBackoff     = 5 * time.Second
+	DefaultRetryMaxRetryAfter  = 10 * time.Second
+)
+
+// MinRetryDelay is the floor under every wait between tries, whatever the policy or a Retry-After
+// header says: a Retry-After of 0 (or one that would not parse) falls back to the backoff, and the
+// backoff itself never goes below this, so no client ever hammers the edge in a tight loop.
+const MinRetryDelay = 50 * time.Millisecond
+
+// maxRetryAfter caps what a Retry-After header can claim, as exposed on Error.RetryAfter; the wait
+// it produces is capped again by RetryPolicy.MaxRetryAfter. Clamped before any Duration arithmetic
+// so a header naming the year 9999 or an overflowing count of seconds can never wrap negative.
+const maxRetryAfter = 24 * time.Hour
+
+// minAttemptBudget is how much of the deadline a retry needs ahead of it to be worth sending: with
+// less than this left the answer could not arrive in time, so the run reports its last real
+// response instead of starting an attempt the deadline would cut short.
+const minAttemptBudget = 500 * time.Millisecond
+
+// legacyRetryWindow is how long after its first attempt a legacy /solve call may still start a
+// retry. The gateway claims the Idempotency-Key for 120s (SET NX EX 120); a resend after that
+// claim has lapsed is not deduplicated but run — and billed — as a fresh solve, so the window
+// stops 20s short of it. A variable, not a constant, only so a test can shrink it.
+var legacyRetryWindow = 100 * time.Second
 
 // Tasks are the supported task types.
 var Tasks = []string{
@@ -83,6 +124,21 @@ type Error struct {
 	// RequestID is the request_id the API puts in every error envelope. Empty for errors the
 	// SDK raises on its own (timeouts, cancellation); quote it when reporting a failure.
 	RequestID string
+	// Attempts is how many times the request went out before this error came back: 1 for a
+	// terminal answer, more when transient failures (429, 5xx, transport) were retried until the
+	// deadline or RetryPolicy.MaxAttempts ran out. 0 for errors raised before any request was made.
+	Attempts int
+	// RetryAfter is the Retry-After the last response carried, capped at 24h; zero when it had
+	// none or it would not parse.
+	RetryAfter time.Duration
+	// IdempotencyKey is the key the request carried — yours, or the one the SDK generated — on the
+	// v2 submit or the legacy /solve, so a failed call can be matched to the job the gateway may
+	// already hold. Empty for Kasada, which carries none, and off the poll.
+	IdempotencyKey string
+
+	// envelope is set when the body was our own JSON error envelope: the answer came from the
+	// gateway, not from the Railway/Cloudflare edge in front of it. Decides the legacy /solve retry.
+	envelope bool
 }
 
 func (e *Error) Error() string {
@@ -91,6 +147,97 @@ func (e *Error) Error() string {
 		s += " request_id=" + e.RequestID
 	}
 	return s
+}
+
+// describe is the one-line form used when a retry run reports its last answer.
+func (e *Error) describe() string {
+	if e.Status == 0 {
+		return e.Code + ": " + e.Message
+	}
+	return fmt.Sprintf("HTTP %d %s: %s", e.Status, e.Code, e.Message)
+}
+
+// RetryPolicy bounds how the client retries transient failures — HTTP 429, 500, 502, 503, 504
+// and transport errors (refused/reset connections, EOF, timeouts, DNS) — on the v2 submit and the
+// v2 status poll, and the narrower set the legacy /solve allows (see SolveDeprecated). Since
+// 2026-10-20 the Railway edge in front of the gateway sheds hundreds of thousands of submits an
+// hour with a bare 429 before they reach the API, and the API itself answers 429/503 under load;
+// those requests succeed a moment later, so failing the solve on the first one lost work for nothing.
+//
+// Retries wait with exponential backoff — InitialBackoff, doubling, capped at MaxBackoff — with
+// full jitter (uniform in [MinRetryDelay, backoff]); a Retry-After header is honoured instead,
+// capped at MaxRetryAfter. No wait is ever shorter than MinRetryDelay. They stop at the caller's
+// deadline (Deadline / the context) — a retry is not started with under 500ms of it left — or at
+// MaxAttempts when that is set. The zero (or negative) value of any duration means its Default*
+// constant.
+type RetryPolicy struct {
+	// MaxAttempts caps the tries, the first one included; 0 means retry until the deadline.
+	MaxAttempts int
+	// InitialBackoff is the wait after the first failure; it doubles on each one after.
+	InitialBackoff time.Duration
+	// MaxBackoff caps the doubling.
+	MaxBackoff time.Duration
+	// MaxRetryAfter caps how long a Retry-After header can hold a retry back.
+	MaxRetryAfter time.Duration
+	// Disabled turns retries off: every transient failure is returned at once, as before.
+	Disabled bool
+}
+
+// DefaultRetryPolicy is the policy New installs: retry until the deadline, 250ms doubling to 5s
+// with full jitter, Retry-After honoured up to 10s.
+func DefaultRetryPolicy() RetryPolicy {
+	return RetryPolicy{InitialBackoff: DefaultRetryInitialBackoff, MaxBackoff: DefaultRetryMaxBackoff, MaxRetryAfter: DefaultRetryMaxRetryAfter}
+}
+
+func (p RetryPolicy) withDefaults() RetryPolicy {
+	d := DefaultRetryPolicy()
+	if p.InitialBackoff <= 0 {
+		p.InitialBackoff = d.InitialBackoff
+	}
+	if p.MaxBackoff <= 0 {
+		p.MaxBackoff = d.MaxBackoff
+	}
+	if p.MaxRetryAfter <= 0 {
+		p.MaxRetryAfter = d.MaxRetryAfter
+	}
+	return p
+}
+
+// Delay is the wait before the next try after `failures` consecutive transient failures (1 after
+// the first). retryAfter is what the last response asked for, or zero: when set it wins, capped at
+// MaxRetryAfter and unjittered, since the server named the moment it wants the retry at. Either
+// way the result is never under MinRetryDelay. Exposed so a caller driving SubmitSolve/GetSolve
+// by hand can pace its own loop the same way.
+func (p RetryPolicy) Delay(failures int, retryAfter time.Duration) time.Duration {
+	p = p.withDefaults()
+	if retryAfter > 0 {
+		if retryAfter > p.MaxRetryAfter {
+			retryAfter = p.MaxRetryAfter
+		}
+		if retryAfter < MinRetryDelay {
+			return MinRetryDelay
+		}
+		return retryAfter
+	}
+	// Double by loop rather than shift, stopping at the cap: no overflow for any input.
+	backoff := p.InitialBackoff
+	for i := 1; i < failures && backoff < p.MaxBackoff; i++ {
+		if backoff > p.MaxBackoff/2 {
+			backoff = p.MaxBackoff
+			break
+		}
+		backoff *= 2
+	}
+	if backoff > p.MaxBackoff {
+		backoff = p.MaxBackoff
+	}
+	if backoff <= MinRetryDelay {
+		return MinRetryDelay
+	}
+	// Full jitter over [MinRetryDelay, backoff]: a fleet of clients shed by the edge at the same
+	// instant must not come back in lockstep, or the edge sheds them all again — and none of them
+	// may come back at once, which is what the floor is for.
+	return MinRetryDelay + time.Duration(mrand.Int63n(int64(backoff-MinRetryDelay)+1))
 }
 
 // SolveParams describes a solve request. Set Enterprise and/or Proxy and the task
@@ -114,9 +261,12 @@ type SolveParams struct {
 	CallbackURL string
 	// IdempotencyKey is sent as the Idempotency-Key header on the submit. The gateway dedupes
 	// on it durably and across shards, so a caller that retries a submit whose answer it never
-	// saw gets the original job back instead of paying for a second solve. Opaque, and yours
-	// to generate — the SDK never invents one, since a key it made up would not survive the
-	// process that would need it. The *Deprecated methods ignore it.
+	// saw gets the original job back instead of paying for a second solve. Opaque. Leave it
+	// empty and the SDK generates a UUIDv4 per Solve call (since 2026-10-20) so its own retries
+	// of a 5xx that may already have landed cannot double-solve or double-charge; set it to
+	// something that survives your process if you want to retry across restarts. SolveDeprecated
+	// sends it too — yours, or one generated per call — and retries under the narrower rule
+	// described there.
 	IdempotencyKey string
 	// Deadline is the whole budget a solve has — the submit and every poll after it. Zero means
 	// DefaultSolveDeadline. A context deadline still wins if it comes first.
@@ -146,6 +296,9 @@ type SolveResult struct {
 type Submission struct {
 	ID     string `json:"id"`
 	Status string `json:"status"`
+	// IdempotencyKey is the key the submit carried: SolveParams.IdempotencyKey when set, else the
+	// one the SDK generated. Resubmitting with it returns this same job.
+	IdempotencyKey string `json:"-"`
 }
 
 // Job is one GET /v2/solve/{id} poll. The envelope (id, status, error, timings) is always
@@ -227,6 +380,10 @@ type EvaluateParams struct {
 	QueueID     string // join_queue only; sent as queueId
 	EventID     string // join_queue only; sent as eventId
 	UserAgent   string // defaults to DefaultUserAgent; an explicit value always wins
+	// IdempotencyKey is sent as the Idempotency-Key header on the v2 submit; empty means the SDK
+	// generates one per call, as for Solve. EvaluateDeprecated sends it too, generated when empty,
+	// and retries under the same rule as SolveDeprecated.
+	IdempotencyKey string
 	// Deadline / PollInterval bound the async wait; zero means the defaults. Evaluate drives a
 	// full BotGuard VM, so leave Deadline at the 120s default unless you know your flow is faster.
 	Deadline     time.Duration
@@ -276,6 +433,7 @@ type Client struct {
 	apiKey  string
 	baseURL string
 	http    *http.Client
+	retry   RetryPolicy
 }
 
 // Option configures a Client.
@@ -287,12 +445,20 @@ func WithBaseURL(u string) Option { return func(c *Client) { c.baseURL = strings
 // WithHTTPClient supplies a custom *http.Client (e.g. a different timeout).
 func WithHTTPClient(h *http.Client) Option { return func(c *Client) { c.http = h } }
 
+// WithRetryPolicy replaces the default retry policy. Zero durations keep their defaults, so
+// RetryPolicy{MaxAttempts: 3} is a complete policy.
+func WithRetryPolicy(p RetryPolicy) Option { return func(c *Client) { c.retry = p.withDefaults() } }
+
+// WithoutRetries turns transient-failure retries off: the first 429, 5xx or transport error is
+// returned as it was before 2026-10-20.
+func WithoutRetries() Option { return func(c *Client) { c.retry.Disabled = true } }
+
 // New creates a client. Panics if apiKey is empty.
 func New(apiKey string, opts ...Option) *Client {
 	if apiKey == "" {
 		panic("kagedcap: apiKey is required")
 	}
-	c := &Client{apiKey: apiKey, baseURL: DefaultBaseURL, http: &http.Client{Timeout: 120 * time.Second}}
+	c := &Client{apiKey: apiKey, baseURL: DefaultBaseURL, http: &http.Client{Timeout: 120 * time.Second}, retry: DefaultRetryPolicy()}
 	for _, o := range opts {
 		o(c)
 	}
@@ -385,7 +551,10 @@ func (c *Client) GetSolveContext(ctx context.Context, id string) (*Job, error) {
 		return nil, &Error{Code: "validation_error", Message: "GetSolve: id is required"}
 	}
 	var job Job
-	if err := c.request(ctx, http.MethodGet, "/v2/solve/"+id, nil, &job); err != nil {
+	err := c.withRetries(ctx, retryAsync, "polling solve "+id, func(ctx context.Context) error {
+		return c.request(ctx, http.MethodGet, "/v2/solve/"+id, nil, &job)
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &job, nil
@@ -393,8 +562,22 @@ func (c *Client) GetSolveContext(ctx context.Context, id string) (*Job, error) {
 
 // SolveDeprecated solves a captcha over the legacy synchronous /solve endpoint, which holds
 // the HTTP connection open for the whole solve. Behaviour is exactly what Solve did before
-// v2; the async fields (CallbackURL, IdempotencyKey, Deadline, PollInterval) do not apply and
-// are ignored — the client's own http.Client timeout is the only bound.
+// v2; CallbackURL, Deadline and PollInterval do not apply and are ignored — the client's own
+// http.Client timeout bounds each request.
+//
+// Every call carries an Idempotency-Key — IdempotencyKey when set, else a UUIDv4 minted once per
+// call — resent unchanged on every retry, so a bare call is no longer single-shot: a retry of a
+// request the gateway may already be solving lands on that solve instead of a second, billable
+// one. Only failures that never reached the gateway are retried — transport errors and the edge's
+// own non-JSON 429/502/503/504 pages. A 429/5xx carrying the gateway's JSON envelope is final: the
+// gateway claims the key before it does anything else, so resending would only answer 409
+// idempotency_conflict (and a retry that does meet that 409 reports the failure before it). No
+// retry is started more than 100s after the call's first attempt went out, because the gateway's
+// claim on the key lives 120s and a later resend would run — and bill — a fresh solve rather than
+// be deduplicated; the run then reports its last real response with the attempt count and the
+// elapsed time, as it does at the deadline. The retry run on a context without a deadline
+// (SolveDeprecated itself) gets DefaultSolveDeadline as a ceiling; pass your own through
+// SolveDeprecatedContext to change it.
 //
 // Deprecated: use Solve, which submits to /v2/solve and polls for the result.
 func (c *Client) SolveDeprecated(p SolveParams) (*SolveResult, error) {
@@ -406,7 +589,7 @@ func (c *Client) SolveDeprecated(p SolveParams) (*SolveResult, error) {
 // Deprecated: use SolveContext.
 func (c *Client) SolveDeprecatedContext(ctx context.Context, p SolveParams) (*SolveResult, error) {
 	var out SolveResult
-	if err := c.request(ctx, http.MethodPost, "/solve", solveBody(p, taskFor(p)), &out); err != nil {
+	if err := c.syncSolve(ctx, solveBody(p, taskFor(p)), p.IdempotencyKey, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -468,7 +651,7 @@ func (c *Client) Evaluate(p EvaluateParams) (*EvaluateResult, error) {
 func (c *Client) EvaluateContext(ctx context.Context, p EvaluateParams) (*EvaluateResult, error) {
 	ctx, cancel := withDeadline(ctx, p.Deadline)
 	defer cancel()
-	sub, err := c.submitRaw(ctx, evaluateBody(p), "")
+	sub, err := c.submitRaw(ctx, evaluateBody(p), p.IdempotencyKey)
 	if err != nil {
 		return nil, solveWaitErr(ctx, "submitting the evaluate", err)
 	}
@@ -484,12 +667,14 @@ func (c *Client) EvaluateContext(ctx context.Context, p EvaluateParams) (*Evalua
 	return job.toEvaluateResult(), nil
 }
 
-// EvaluateDeprecated runs evaluate over the legacy synchronous /solve endpoint.
+// EvaluateDeprecated runs evaluate over the legacy synchronous /solve endpoint. It always carries
+// an Idempotency-Key — IdempotencyKey when set, else one minted per call — and retries under the
+// same rule as SolveDeprecated.
 //
 // Deprecated: use Evaluate, which submits to /v2/solve and polls for the result.
 func (c *Client) EvaluateDeprecated(p EvaluateParams) (*EvaluateResult, error) {
 	var out EvaluateResult
-	if err := c.request(context.Background(), http.MethodPost, "/solve", evaluateBody(p), &out); err != nil {
+	if err := c.syncSolve(context.Background(), evaluateBody(p), p.IdempotencyKey, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -506,31 +691,320 @@ func (c *Client) CheckBalance() (*Balance, error) {
 
 // kasadaSync POSTs a Kasada body to the synchronous /solve endpoint and decodes the full result
 // directly — no submit-and-poll. It backs KasadaLogin/KasadaReload and their *Deprecated aliases.
+// KasadaParams has no key field, so the request goes out exactly once: without an Idempotency-Key
+// a retry of a request the gateway may already be solving would be a second, billable solve.
 func (c *Client) kasadaSync(ctx context.Context, body map[string]any) (*KasadaResult, error) {
 	var out KasadaResult
-	if err := c.request(ctx, http.MethodPost, "/solve", body, &out); err != nil {
+	err := oneAttempt(ctx, func(ctx context.Context) error {
+		return c.request(ctx, http.MethodPost, "/solve", body, &out)
+	})
+	if err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// submitRaw POSTs a prepared body to /v2/solve and returns the acknowledgement.
+// syncSolve POSTs a body to the legacy synchronous /solve under an Idempotency-Key — the caller's,
+// or a UUIDv4 minted here, exactly as submitRaw does — resent unchanged on every retry, so the
+// gateway dedupes a resend of a request it is already solving. Only a failure that never reached
+// it is retried (see isTransient), and none past legacyRetryWindow (see withRetries).
+func (c *Client) syncSolve(ctx context.Context, body map[string]any, idempotencyKey string, out any) error {
+	if idempotencyKey == "" {
+		idempotencyKey = newIdempotencyKey()
+	}
+	err := c.withRetries(ctx, retrySync, "on the synchronous /solve", func(ctx context.Context) error {
+		return c.request(ctx, http.MethodPost, "/solve", body, out, withIdempotencyKey(idempotencyKey))
+	})
+	return tagIdempotencyKey(err, idempotencyKey)
+}
+
+// submitRaw POSTs a prepared body to /v2/solve and returns the acknowledgement. The submit
+// always carries an Idempotency-Key — the caller's, or a UUIDv4 minted here — because a retry
+// of a 5xx/timeout the gateway may already have accepted must land on the same job, not a
+// second billable one. Every retry resends the same key (2026-10-20).
 func (c *Client) submitRaw(ctx context.Context, body map[string]any, idempotencyKey string) (*Submission, error) {
+	if idempotencyKey == "" {
+		idempotencyKey = newIdempotencyKey()
+	}
 	var sub Submission
-	if err := c.request(ctx, http.MethodPost, "/v2/solve", body, &sub, withIdempotencyKey(idempotencyKey)); err != nil {
-		return nil, err
+	err := c.withRetries(ctx, retryAsync, "submitting to /v2/solve", func(ctx context.Context) error {
+		return c.request(ctx, http.MethodPost, "/v2/solve", body, &sub, withIdempotencyKey(idempotencyKey))
+	})
+	if err != nil {
+		return nil, tagIdempotencyKey(err, idempotencyKey)
 	}
 	if sub.ID == "" {
 		// The submit answered 202 without an id, so there is nothing to poll and no way to find
 		// the job again. Gateway bug, not the caller's — name it as one.
-		return nil, &Error{Code: "internal_error", Message: "/v2/solve accepted the job but returned no id"}
+		return nil, &Error{Code: "internal_error", Message: "/v2/solve accepted the job but returned no id", IdempotencyKey: idempotencyKey}
 	}
+	sub.IdempotencyKey = idempotencyKey
 	return &sub, nil
+}
+
+// retryKind says which endpoint a retry loop guards: the same 5xx reads differently on each
+// (see isTransient).
+type retryKind int
+
+const (
+	retryAsync retryKind = iota // POST /v2/solve and GET /v2/solve/{id}
+	retrySync                   // POST /solve carrying an Idempotency-Key
+)
+
+// terminalCodes are API errors that say the request — or the key behind it — is wrong, whatever
+// the status: the same request again gets the same answer, so a retry only burns the deadline.
+// key_frozen is a 429 that does not thaw within any deadline; the subscription and host codes
+// arrive as 402/403 today and are listed so a change of status could not make them retryable.
+var terminalCodes = map[string]bool{
+	"validation_error": true, "unauthorized": true, "key_revoked": true, "account_suspended": true,
+	"insufficient_funds": true, "key_spend_cap_reached": true, "proxy_invalid": true, "proxy_required": true,
+	"proxy_not_allowed": true, "unsupported_task": true, "action_required": true, "callback_url_invalid": true,
+	"not_found": true, "idempotency_conflict": true, "key_frozen": true, "subscription_quota_exhausted": true,
+	"subscription_past_due": true, "host_not_allowed": true,
+}
+
+// isTransient reports whether a failure is worth retrying.
+//
+// On the v2 endpoints: a transport error, or HTTP 429 / 500 / 502 / 503 / 504 with a code that
+// does not condemn the request. Every other status (400, 401, 402, 403, 404, 405, 409, 413, 422,
+// ...) is a verdict on the request and comes straight back. A 5xx on the v2 submit is retried
+// whatever its code — even solve_failed — because the verdict on a v2 job never arrives on the
+// submit response; it comes through the poll body as status "failed", which poll treats as terminal.
+//
+// On the legacy synchronous /solve the rule is narrower: only a failure that never reached the
+// gateway — a transport error, or a 429/502/503/504 without our JSON envelope, which is what the
+// Railway/Cloudflare edge sends when it sheds or cannot reach the app. The gateway claims the
+// Idempotency-Key (SET NX EX 120) before it does anything else, so once a 429/5xx envelope has
+// come back the same key can only answer 409 idempotency_conflict; the first answer is the final one.
+func isTransient(e *Error, kind retryKind) bool {
+	if e.Status == 0 {
+		// Only transport failures; encode_error/request_error are the SDK's own and never clear up.
+		return e.Code == "network_error"
+	}
+	if kind == retrySync {
+		switch e.Status {
+		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return !e.envelope
+		}
+		return false
+	}
+	switch e.Status {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		return !terminalCodes[e.Code]
+	}
+	return false
+}
+
+// withRetries runs attempt until it succeeds, fails terminally, or the budget runs out: the
+// context's deadline, or RetryPolicy.MaxAttempts. A context without a deadline (SubmitSolve or
+// GetSolve on context.Background()) gets DefaultSolveDeadline, so no caller retries forever
+// against a gateway that never recovers. Between tries it waits RetryPolicy.Delay.
+//
+// The first attempt always goes out. A retry is started only when, after its wait, at least
+// minAttemptBudget of the deadline would remain — a wait that could not leave that much is not
+// served at all, since the outcome is already known. The error the run ends on is the last real
+// answer, with its Code/Status/RequestID kept and a Message that says how many tries were made
+// and how long they took — so a solve that died of rate limiting is reported as rate limiting,
+// not as a bare timeout. A request the deadline itself cut short is never that last answer. A
+// context cancelled by the caller ends the run with code "canceled" whatever came before.
+//
+// On the legacy /solve a retry is also never started more than legacyRetryWindow after the first
+// attempt went out: the gateway's claim on the Idempotency-Key lives 120s, and a resend after it
+// lapsed would run (and bill) a fresh solve instead of being deduplicated. That stop reports the
+// last real response, with the attempt count and the elapsed time, exactly as the deadline does.
+func (c *Client) withRetries(ctx context.Context, kind retryKind, where string, attempt func(context.Context) error) error {
+	policy := c.retry
+	if policy.Disabled {
+		return oneAttempt(ctx, attempt)
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultSolveDeadline)
+		defer cancel()
+	}
+	deadline, _ := ctx.Deadline()
+	start := time.Now()
+	var last *Error
+	for n := 1; ; n++ {
+		err := attempt(ctx)
+		if err == nil {
+			return nil
+		}
+		var e *Error
+		if !errors.As(err, &e) {
+			return err // a 2xx whose body would not decode; not a transient condition
+		}
+		if kind == retrySync && e.Code == "idempotency_conflict" && last != nil {
+			return conflictAfterRetry(where, last, n)
+		}
+		if !isTransient(e, kind) {
+			e.Attempts = n
+			return err
+		}
+		if e.Status != 0 || ctx.Err() == nil {
+			// A real answer, or a transport failure of its own. A request the context cut short
+			// is not the run's last word; the response before it is.
+			last = e
+		}
+		if ctx.Err() != nil {
+			return ended(ctx, where, last, n, start)
+		}
+		if policy.MaxAttempts > 0 && n >= policy.MaxAttempts {
+			return gaveUp(where, last, n, time.Since(start))
+		}
+		delay := policy.Delay(n, e.RetryAfter)
+		if time.Until(deadline)-delay < minAttemptBudget {
+			return gaveUp(where, last, n, time.Since(start))
+		}
+		if kind == retrySync && time.Since(start)+delay > legacyRetryWindow {
+			// The retry would go out after the gateway's claim on the key has lapsed, so it could
+			// not be deduplicated; the wait is not served, since the outcome is already known.
+			return gaveUp(where, last, n, time.Since(start))
+		}
+		if !sleepCtx(ctx, delay) {
+			return ended(ctx, where, last, n, start)
+		}
+	}
+}
+
+// oneAttempt sends a request exactly once — retries off, or a Kasada /solve, which carries no key —
+// and stamps its error with the attempt count, so Attempts reads the same whichever path answered.
+func oneAttempt(ctx context.Context, attempt func(context.Context) error) error {
+	err := attempt(ctx)
+	var e *Error
+	if errors.As(err, &e) {
+		e.Attempts = 1
+	}
+	return err
+}
+
+// ended is the error for a retry run the context stopped: a cancellation is reported as one,
+// whatever the responses before it said; a deadline reports the last real response, or a plain
+// timeout when the deadline cut the only request short.
+func ended(ctx context.Context, where string, last *Error, attempts int, start time.Time) *Error {
+	if ctx.Err() == context.Canceled {
+		msg := fmt.Sprintf("context canceled %s after %s", where, plural(attempts, "attempt"))
+		if last != nil {
+			msg += "; last response: " + last.describe()
+		}
+		return &Error{Code: "canceled", Message: msg, Attempts: attempts}
+	}
+	if last == nil {
+		return &Error{Code: "solve_timeout", Message: "deadline exceeded " + where, Attempts: attempts}
+	}
+	return gaveUp(where, last, attempts, time.Since(start))
+}
+
+// gaveUp is the error a retry run ends on: the last answer's identity, plus the run's story.
+func gaveUp(where string, last *Error, attempts int, waited time.Duration) *Error {
+	return withLast(last, attempts, fmt.Sprintf("gave up %s after %s over %s; last response: %s",
+		where, plural(attempts, "attempt"), waited.Round(time.Millisecond), last.describe()))
+}
+
+// conflictAfterRetry is the error for a legacy /solve retry the gateway answered with 409
+// idempotency_conflict: it proves an earlier attempt did reach the gateway, so the honest outcome
+// is that attempt's failure, not the conflict.
+func conflictAfterRetry(where string, last *Error, attempts int) *Error {
+	return withLast(last, attempts, fmt.Sprintf("gave up %s after %s: the retry answered 409 idempotency_conflict, so an earlier attempt reached the gateway; last response: %s",
+		where, plural(attempts, "attempt"), last.describe()))
+}
+
+// withLast builds the error a retry run reports: last's identity under a message of the run's own.
+func withLast(last *Error, attempts int, message string) *Error {
+	return &Error{
+		Status:     last.Status,
+		Code:       last.Code,
+		RequestID:  last.RequestID,
+		RetryAfter: last.RetryAfter,
+		Attempts:   attempts,
+		Message:    message,
+	}
+}
+
+func plural(n int, noun string) string {
+	if n == 1 {
+		return "1 " + noun
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
+// sleepCtx waits d or until ctx ends, reporting whether the full wait was served.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// tagIdempotencyKey records the key a failed submit or legacy /solve carried on the error, so the
+// caller can find the job the gateway may already hold under it.
+func tagIdempotencyKey(err error, key string) error {
+	var e *Error
+	if errors.As(err, &e) {
+		e.IdempotencyKey = key
+	}
+	return err
+}
+
+// newIdempotencyKey mints a random UUIDv4 (RFC 4122) from crypto/rand, stdlib only. The
+// fallback is for a broken entropy source, which does not happen on any supported platform.
+func newIdempotencyKey() string {
+	var b [16]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		for i := range b {
+			b[i] = byte(mrand.Intn(256))
+		}
+	}
+	b[6] = (b[6] & 0x0f) | 0x40 // version 4
+	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// parseRetryAfter reads a Retry-After header: delay-seconds or an HTTP-date. Unparseable, zero,
+// negative, past, or absent is zero, which means "use the backoff"; anything beyond maxRetryAfter
+// is clamped to it before it becomes a Duration, so the result is never negative or wrapped.
+func parseRetryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+		// ParseInt saturates on ErrRange, so an overflowing count keeps its sign: a huge positive
+		// one lands on the cap, a huge negative one on zero.
+		if secs <= 0 {
+			return 0
+		}
+		if secs > int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		return time.Duration(secs) * time.Second
+	}
+	at, err := http.ParseTime(v)
+	if err != nil || at.Year() < 1970 || at.Year() > 9999 {
+		return 0
+	}
+	now := time.Now()
+	if !at.After(now) {
+		return 0
+	}
+	if at.After(now.Add(maxRetryAfter)) {
+		return maxRetryAfter
+	}
+	return at.Sub(now)
 }
 
 // poll loops GET /v2/solve/{id} every interval until the job is done (returns the Job), failed
 // (returns the gateway's error code) or ctx runs out. An unfamiliar status means keep waiting:
-// treating one as terminal would break the SDK the day the gateway adds one.
+// treating one as terminal would break the SDK the day the gateway adds one. A poll that fails
+// transiently (429, 5xx, transport) is retried inside GetSolveContext with the retry backoff;
+// interval only paces the polls that answered.
 func (c *Client) poll(ctx context.Context, id string, interval time.Duration, where string) (*Job, error) {
 	timer := time.NewTimer(interval)
 	defer timer.Stop()
@@ -542,9 +1016,10 @@ func (c *Client) poll(ctx context.Context, id string, interval time.Duration, wh
 		}
 		job, err := c.GetSolveContext(ctx, id)
 		if err != nil {
-			// Includes not_found (404), which the gateway also returns for a job belonging to
-			// another account. Either way the id will never resolve, so stop rather than burn
-			// the deadline on it.
+			// Transient failures were already retried inside GetSolveContext, so what arrives
+			// here is terminal: not_found (404, which the gateway also returns for a job belonging
+			// to another account — the id will never resolve), another verdict on the request, or
+			// a retry run that exhausted the deadline. Stop rather than burn what is left of it.
 			return nil, solveWaitErr(ctx, where, err)
 		}
 		switch job.Status {
@@ -613,25 +1088,25 @@ func (c *Client) request(ctx context.Context, method, path string, body map[stri
 			RequestID string `json:"request_id"`
 		}
 		_ = json.Unmarshal(data, &e)
-		if e.Error == "" {
+		// Our envelope always names an error; the Railway/Cloudflare edge's own 429/5xx pages are
+		// plain text or HTML (Railway's 502 is JSON, but keyed on status/code/message, not error).
+		envelope := e.Error != ""
+		if !envelope {
 			e.Error = "error"
 		}
 		if e.Message == "" {
 			e.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		}
-		return &Error{Status: resp.StatusCode, Code: e.Error, Message: e.Message, RequestID: e.RequestID}
+		return &Error{Status: resp.StatusCode, Code: e.Error, Message: e.Message, RequestID: e.RequestID,
+			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")), envelope: envelope}
 	}
 	return json.Unmarshal(data, out)
 }
 
-// withIdempotencyKey sets the Idempotency-Key header when the caller supplied one. Empty is
-// the normal case and sends no header at all, which is what the gateway expects.
+// withIdempotencyKey sets the Idempotency-Key header. The v2 submit and the legacy /solve both
+// always carry one (the caller's, or a generated UUIDv4); Kasada sends none and never comes here.
 func withIdempotencyKey(key string) func(*http.Request) {
-	return func(r *http.Request) {
-		if key != "" {
-			r.Header.Set("Idempotency-Key", key)
-		}
-	}
+	return func(r *http.Request) { r.Header.Set("Idempotency-Key", key) }
 }
 
 // isKasadaTask reports whether a task is a Kasada one — the family whose result has no token and
@@ -711,10 +1186,16 @@ func expiredErr(kind, id string) *Error {
 	return &Error{Code: "result_expired", Message: kind + " " + id + " completed but its result has already been cleared; results are kept for about five minutes"}
 }
 
-// solveWaitErr keeps the poll loop speaking the SDK's error type: a context that ran out is a
-// solve_timeout whichever deadline fired, the caller's own or the per-call Deadline. Anything
-// else is a real transport or API failure and travels untouched.
+// solveWaitErr keeps the poll loop speaking the SDK's error type: a context that ran out between
+// polls is a solve_timeout whichever deadline fired, the caller's own or the per-call Deadline,
+// and a cancelled one is canceled. Anything that went through a retry run travels untouched —
+// it already names the last real status and the attempt count (or canceled / solve_timeout with
+// the count), and says more than a bare timeout would.
 func solveWaitErr(ctx context.Context, where string, err error) error {
+	var e *Error
+	if errors.As(err, &e) && e.Attempts > 0 {
+		return err
+	}
 	switch ctx.Err() {
 	case context.DeadlineExceeded:
 		return &Error{Code: "solve_timeout", Message: "deadline exceeded " + where}
