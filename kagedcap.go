@@ -111,6 +111,11 @@ var Tasks = []string{
 	"ReCaptchaV2Task",
 	"ReCaptchaV2TaskProxyLess",
 	"TicketmasterTmptTask",
+	// Same solve and exchange as TicketmasterTmptTask, but the solver PROVES the cookie with
+	// a HEAD to the caller's own URL before returning it, re-solving on its own egress (and
+	// walking Chrome majors) when the edge refuses. Up to four billed solves in one call, so
+	// a caller that does not want that latency keeps TicketmasterTmptTask.
+	"TicketmasterTmptTaskEnterprise",
 	"KasadaLogin",
 	"KasadaReload",
 	"EvaluateTask",
@@ -1086,6 +1091,14 @@ func (c *Client) request(ctx context.Context, method, path string, body map[stri
 			Error     string `json:"error"`
 			Message   string `json:"message"`
 			RequestID string `json:"request_id"`
+			// The controller returns the exact field issues on a 400
+			// validation_error. Dropping them left the caller with the bare
+			// code and nothing to act on: the gateway knew which field was
+			// wrong and the SDK threw the answer away.
+			Issues []struct {
+				Path    string `json:"path"`
+				Message string `json:"message"`
+			} `json:"issues"`
 		}
 		_ = json.Unmarshal(data, &e)
 		// Our envelope always names an error; the Railway/Cloudflare edge's own 429/5xx pages are
@@ -1096,6 +1109,27 @@ func (c *Client) request(ctx context.Context, method, path string, body map[stri
 		}
 		if e.Message == "" {
 			e.Message = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+		// Append the field issues to the message rather than adding a field
+		// nobody reads: every caller already prints Error(), so this is the one
+		// place a validation_error can become actionable without each of them
+		// changing. "validation_error" alone sent a real debugging session
+		// hunting the whole body.
+		if len(e.Issues) > 0 {
+			parts := make([]string, 0, len(e.Issues))
+			for _, iss := range e.Issues {
+				switch {
+				case iss.Path != "" && iss.Message != "":
+					parts = append(parts, iss.Path+": "+iss.Message)
+				case iss.Path != "":
+					parts = append(parts, iss.Path)
+				case iss.Message != "":
+					parts = append(parts, iss.Message)
+				}
+			}
+			if len(parts) > 0 {
+				e.Message += " (" + strings.Join(parts, "; ") + ")"
+			}
 		}
 		return &Error{Status: resp.StatusCode, Code: e.Error, Message: e.Message, RequestID: e.RequestID,
 			RetryAfter: parseRetryAfter(resp.Header.Get("Retry-After")), envelope: envelope}
@@ -1123,7 +1157,14 @@ func taskFor(p SolveParams) string {
 // solveBody builds the solve request body shared by /v2/solve and the legacy /solve — they
 // take the same JSON, and v2 only adds an optional callback_url on top.
 func solveBody(p SolveParams, task string) map[string]any {
-	body := map[string]any{"task": task, "url": p.URL, "sitekey": p.Sitekey}
+	body := map[string]any{"task": task, "url": p.URL}
+	// Omitted when empty, like action and for the same reason: the gateway's schema is strict
+	// and types sitekey as a non-empty optional string, so a literal "" is a validation_error
+	// rather than an absent field. That only ever bites the tasks whose sitekey lives
+	// server-side — tmpt and evaluate — which have no sitekey to send and were rejected for
+	// sending the empty one. reCAPTCHA is unaffected: it must send a sitekey either way, and
+	// a caller that omits one is still refused, just by name instead of by length.
+	putIf(body, "sitekey", p.Sitekey)
 	putIf(body, "action", p.Action) // omit when empty — reCAPTCHA v2 has no action, and "" fails validation
 	putIf(body, "proxy", p.Proxy)
 	putIf(body, "userAgent", userAgentFor(task, p.UserAgent))

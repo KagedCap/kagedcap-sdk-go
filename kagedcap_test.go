@@ -1538,3 +1538,118 @@ func TestGetSolveWithoutADeadlineStillStopsRetrying(t *testing.T) {
 		t.Errorf("got status=%d attempts=%d polls=%d, want 429 after 4", e.Status, e.Attempts, polls.Load())
 	}
 }
+
+// A tmpt solve carries no sitekey — the solver holds it — and the gateway's schema is strict
+// about an empty one, so the field must be ABSENT rather than "". Sending the empty string
+// made every tmpt and evaluate solve a validation_error.
+func TestTmptEnterpriseSolveOmitsSitekey(t *testing.T) {
+	submitted := make(chan map[string]any, 1)
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/solve":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			submitted <- body
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-1","status":"running"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/solve/job-1":
+			io.WriteString(w, `{"success":true,"id":"job-1","status":"done","token":"TMPT-COOKIE","task":"TicketmasterTmptTaskEnterprise"}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}, fastRetries())
+
+	res, err := kc.Solve(kagedcap.SolveParams{
+		Task:         "TicketmasterTmptTaskEnterprise",
+		URL:          "https://www.ticketmaster.com/event/EVENT",
+		Action:       "Event",
+		Proxy:        "http://user:pass@proxy.example:8080",
+		UserAgent:    "UA/1.0",
+		PollInterval: 5 * time.Millisecond,
+		Deadline:     2 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("Solve: %v", err)
+	}
+	if res.Token != "TMPT-COOKIE" {
+		t.Errorf("token = %q, want the cookie the solver minted", res.Token)
+	}
+
+	body := <-submitted
+	if _, present := body["sitekey"]; present {
+		t.Errorf("sitekey was sent (%v); the gateway rejects an empty one and tmpt has none to send", body["sitekey"])
+	}
+	if body["task"] != "TicketmasterTmptTaskEnterprise" {
+		t.Errorf("task = %v, want the explicit task to win over derivation", body["task"])
+	}
+	if body["action"] != "Event" {
+		t.Errorf("action = %v, want Event — the solver keys its page profile off it", body["action"])
+	}
+	if body["proxy"] != "http://user:pass@proxy.example:8080" {
+		t.Errorf("proxy = %v, want the caller's own egress", body["proxy"])
+	}
+	if body["userAgent"] != "UA/1.0" {
+		t.Errorf("userAgent = %v, want the caller's explicit UA", body["userAgent"])
+	}
+}
+
+// A reCAPTCHA solve still sends its sitekey — omitting an EMPTY one must not have made the
+// one task family that requires the field start leaving it out.
+func TestRecaptchaSolveStillSendsItsSitekey(t *testing.T) {
+	submitted := make(chan map[string]any, 1)
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/solve":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			submitted <- body
+			w.WriteHeader(http.StatusAccepted)
+			io.WriteString(w, `{"success":true,"id":"job-1","status":"running"}`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/solve/job-1":
+			io.WriteString(w, `{"success":true,"id":"job-1","status":"done","token":"tok"}`)
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}, fastRetries())
+
+	if _, err := kc.Solve(params()); err != nil {
+		t.Fatalf("Solve: %v", err)
+	}
+	if body := <-submitted; body["sitekey"] != "6Lc-test" {
+		t.Errorf("sitekey = %v, want it still sent for reCAPTCHA", body["sitekey"])
+	}
+}
+
+// A 400 validation_error names the offending fields in `issues`. The SDK used to decode only
+// error/message/request_id, so a caller saw the bare code and had to guess which field of the
+// body the gateway disliked.
+func TestValidationErrorCarriesTheFieldIssues(t *testing.T) {
+	kc := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"success":false,"error":"validation_error","message":"invalid request","request_id":"req-7",`+
+			`"issues":[{"path":"action","message":"action must be one of 'Event', 'FREvent', 'Login', 'LoginPage' for TicketmasterTmptTask"},`+
+			`{"path":"sitekey","message":"String must contain at least 1 character(s)"}]}`)
+	}, fastRetries())
+
+	_, err := kc.Solve(kagedcap.SolveParams{
+		Task:         "TicketmasterTmptTaskEnterprise",
+		URL:          "https://www.ticketmaster.com/event/EVENT",
+		PollInterval: 5 * time.Millisecond,
+		Deadline:     2 * time.Second,
+	})
+	e := kcErr(t, err)
+	if e.Code != "validation_error" {
+		t.Fatalf("code = %q, want validation_error", e.Code)
+	}
+	for _, want := range []string{"action", "sitekey", "must be one of"} {
+		if !strings.Contains(e.Error(), want) {
+			t.Errorf("error text is missing %q, so the caller still cannot tell what was wrong: %s", want, e.Error())
+		}
+	}
+	if e.RequestID != "req-7" {
+		t.Errorf("request_id = %q, want it preserved for support", e.RequestID)
+	}
+}
